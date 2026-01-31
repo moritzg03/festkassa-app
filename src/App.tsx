@@ -49,16 +49,26 @@ type ReceiptItemRow = {
   line_total_gross: number;
 };
 
+// ====== KONFIG ======
 const EVENT_ID = "00000000-0000-0000-0000-000000000001";
+const VAT_RATE = 0.2;
+
 const STORAGE_KEY_BAR = "festkassa:selectedBarId";
 const STORAGE_KEY_DEVICE = "festkassa:deviceId";
 const STORAGE_KEY_STAFF = "festkassa:staffSession"; // JSON
 
+// ====== HELPERS ======
 function euro(n: number) {
   return new Intl.NumberFormat("de-AT", { style: "currency", currency: "EUR" }).format(n);
 }
 function round2(n: number) {
   return Math.round((n + Number.EPSILON) * 100) / 100;
+}
+function netFromGross(gross: number) {
+  return round2(gross / (1 + VAT_RATE));
+}
+function taxFromGross(gross: number) {
+  return round2(gross - netFromGross(gross));
 }
 function randomToken(len = 40) {
   const chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
@@ -75,7 +85,6 @@ function getDeviceId() {
   localStorage.setItem(STORAGE_KEY_DEVICE, id);
   return id;
 }
-
 function isReceiptRoute() {
   return window.location.pathname.startsWith("/r/");
 }
@@ -84,26 +93,6 @@ function getReceiptTokenFromPath() {
   const t = window.location.pathname.replace("/r/", "").trim();
   return t.length ? t : null;
 }
-
-/**
- * ✅ PIN-Check via RPC (Hash in DB)
- */
-async function checkPin(pin: string): Promise<StaffAuth | null> {
-  const clean = pin.trim();
-  if (!clean) return null;
-
-  const { data, error } = await supabase.rpc("check_staff_pin", { pin_input: clean });
-  if (error) return null;
-
-  const row = (data as any[])?.[0];
-  if (!row) return null;
-
-  const role = row.role as "staff" | "admin";
-  if (role !== "staff" && role !== "admin") return null;
-
-  return { id: row.id, name: row.name, role };
-}
-
 function loadStaffSession(): StaffAuth | null {
   try {
     const raw = localStorage.getItem(STORAGE_KEY_STAFF);
@@ -123,12 +112,46 @@ function clearStaffSession() {
   localStorage.removeItem(STORAGE_KEY_STAFF);
 }
 
+function useIsNarrow(breakpointPx = 900) {
+  const [isNarrow, setIsNarrow] = useState(() => window.innerWidth < breakpointPx);
+
+  useEffect(() => {
+    const onResize = () => setIsNarrow(window.innerWidth < breakpointPx);
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, [breakpointPx]);
+
+  return isNarrow;
+}
+
+/**
+ * ✅ PIN-Check via RPC (Hash in DB)
+ * RPC: public.check_staff_pin(pin_input text) returns table (id uuid, name text, role text)
+ */
+async function checkPin(pin: string): Promise<StaffAuth | null> {
+  const clean = pin.trim();
+  if (!clean) return null;
+
+  const { data, error } = await supabase.rpc("check_staff_pin", { pin_input: clean });
+  if (error) return null;
+
+  const row = (data as any[])?.[0];
+  if (!row) return null;
+
+  const role = row.role as "staff" | "admin";
+  if (role !== "staff" && role !== "admin") return null;
+
+  return { id: row.id, name: row.name, role };
+}
+
 export default function App() {
   if (isReceiptRoute()) return <ReceiptPage />;
   return <KassaPage />;
 }
 
 function KassaPage() {
+  const isNarrow = useIsNarrow(900);
+
   const [bars, setBars] = useState<Bar[]>([]);
   const [selectedBarId, setSelectedBarId] = useState<string | null>(() => localStorage.getItem(STORAGE_KEY_BAR));
   const [products, setProducts] = useState<Product[]>([]);
@@ -143,7 +166,7 @@ function KassaPage() {
   const [lastReceipt, setLastReceipt] = useState<ReceiptResponse | null>(null);
   const [qrDataUrl, setQrDataUrl] = useState<string | null>(null);
 
-  // Mitarbeiter-Storno (letzter Bon, ohne Grund, PIN staff/admin)
+  // Mitarbeiter-Storno (letzter Bon, PIN staff/admin)
   const [voidOpen, setVoidOpen] = useState(false);
   const [voidPin, setVoidPin] = useState("");
   const [voidLoading, setVoidLoading] = useState(false);
@@ -177,10 +200,267 @@ function KassaPage() {
   const cartLines = useMemo(() => Object.values(cart), [cart]);
 
   const grossTotal = useMemo(() => round2(cartLines.reduce((s, l) => s + Number(l.product.price_gross) * l.qty, 0)), [cartLines]);
-  const taxTotal = useMemo(() => round2(grossTotal * (20 / 120)), [grossTotal]); // 20% aus Bruttopreis
-  const netTotal = useMemo(() => round2(grossTotal - taxTotal), [grossTotal, taxTotal]);
+  const netTotal = useMemo(() => netFromGross(grossTotal), [grossTotal]);
+  const taxTotal = useMemo(() => taxFromGross(grossTotal), [grossTotal]);
 
-  // Bars laden
+  // ====== Styles (any, damit TS bei dynamischen Funktionen nicht nervt) ======
+  const styles: Record<string, any> = {
+    page: {
+      minHeight: "100vh",
+      background:
+        "radial-gradient(1200px 600px at 20% 10%, rgba(120, 0, 255, 0.25), transparent 55%)," +
+        "radial-gradient(900px 500px at 85% 20%, rgba(0, 255, 200, 0.18), transparent 55%)," +
+        "radial-gradient(900px 700px at 60% 90%, rgba(0, 120, 255, 0.12), transparent 60%)," +
+        "linear-gradient(180deg, #050510 0%, #07071a 35%, #04040c 100%)",
+      color: "#e9e9ff",
+      fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif",
+    },
+    topbar: {
+      position: "sticky",
+      top: 0,
+      zIndex: 10,
+      backdropFilter: "blur(10px)",
+      background: "rgba(5,5,16,0.6)",
+      borderBottom: "1px solid rgba(255,255,255,0.08)",
+    },
+    topbarInner: {
+      maxWidth: 1280,
+      margin: "0 auto",
+      padding: "14px 16px",
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "space-between",
+      gap: 12,
+      flexWrap: "wrap",
+    },
+    brand: { display: "flex", flexDirection: "column", lineHeight: 1.05 },
+    title: { margin: 0, fontWeight: 900, letterSpacing: 1.2, textTransform: "uppercase", fontSize: 18 },
+    subtitle: { margin: "4px 0 0 0", opacity: 0.75, fontSize: 13, letterSpacing: 0.4 },
+
+    layout: (narrow: boolean): React.CSSProperties => ({
+      maxWidth: 1280,
+      margin: "0 auto",
+      padding: 16,
+      display: "grid",
+      gridTemplateColumns: narrow ? "1fr" : "1fr 380px",
+      gap: 16,
+      alignItems: "start",
+    }),
+
+    card: {
+      borderRadius: 18,
+      border: "1px solid rgba(255,255,255,0.10)",
+      background: "rgba(12,12,28,0.55)",
+      boxShadow: "0 12px 40px rgba(0,0,0,0.35), inset 0 1px 0 rgba(255,255,255,0.06)",
+      overflow: "hidden",
+    },
+    cardHeader: {
+      padding: "14px 14px",
+      borderBottom: "1px solid rgba(255,255,255,0.08)",
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "space-between",
+      gap: 10,
+      flexWrap: "wrap",
+    },
+    cardHeaderTitle: { margin: 0, fontSize: 16, fontWeight: 900, letterSpacing: 0.6, textTransform: "uppercase" },
+
+    pill: {
+      display: "inline-flex",
+      alignItems: "center",
+      gap: 8,
+      padding: "8px 10px",
+      borderRadius: 999,
+      border: "1px solid rgba(255,255,255,0.12)",
+      background: "rgba(255,255,255,0.05)",
+      fontWeight: 800,
+      fontSize: 13,
+      whiteSpace: "nowrap",
+    },
+
+    subtleBtn: {
+      padding: "10px 12px",
+      borderRadius: 14,
+      border: "1px solid rgba(255,255,255,0.12)",
+      background: "rgba(255,255,255,0.06)",
+      color: "#e9e9ff",
+      fontWeight: 800,
+      cursor: "pointer",
+    },
+    dangerBtn: {
+      padding: "10px 12px",
+      borderRadius: 14,
+      border: "1px solid rgba(255,80,80,0.35)",
+      background: "rgba(255,80,80,0.12)",
+      color: "#ffecec",
+      fontWeight: 900,
+      cursor: "pointer",
+    },
+
+    barRow: { display: "flex", gap: 10, flexWrap: "wrap", padding: 14 },
+    barBtn: (active: boolean): React.CSSProperties => ({
+      padding: "12px 14px",
+      borderRadius: 16,
+      border: active ? "1px solid rgba(0,255,200,0.55)" : "1px solid rgba(255,255,255,0.12)",
+      background: active ? "linear-gradient(135deg, rgba(0,255,200,0.18), rgba(120,0,255,0.15))" : "rgba(255,255,255,0.05)",
+      color: active ? "#eafffb" : "#e9e9ff",
+      fontSize: 16,
+      fontWeight: 900,
+      cursor: "pointer",
+    }),
+
+    productsGrid: {
+      padding: 14,
+      display: "grid",
+      gridTemplateColumns: "repeat(auto-fill, minmax(170px, 1fr))",
+      gap: 12,
+    },
+    productCard: {
+      borderRadius: 18,
+      border: "1px solid rgba(255,255,255,0.10)",
+      background: "rgba(10,10,22,0.65)",
+      boxShadow: "0 10px 30px rgba(0,0,0,0.35)",
+      padding: 14,
+      cursor: "pointer",
+      userSelect: "none",
+      touchAction: "manipulation",
+    },
+    productName: { fontSize: 18, fontWeight: 900, marginBottom: 10 },
+    productPrice: { fontSize: 16, opacity: 0.9, fontWeight: 800 },
+
+    rightInner: { padding: 14, display: "flex", flexDirection: "column", gap: 12 },
+
+    totals: {
+      padding: 12,
+      borderRadius: 16,
+      border: "1px solid rgba(255,255,255,0.10)",
+      background: "rgba(255,255,255,0.04)",
+      display: "grid",
+      gap: 8,
+    },
+    totalRow: { display: "flex", justifyContent: "space-between", gap: 10, fontWeight: 800, opacity: 0.95 },
+
+    cartLine: {
+      display: "grid",
+      gridTemplateColumns: "1fr auto",
+      gap: 10,
+      padding: "10px 10px",
+      borderRadius: 14,
+      border: "1px solid rgba(255,255,255,0.10)",
+      background: "rgba(255,255,255,0.04)",
+    },
+    qtyControls: { display: "flex", alignItems: "center", gap: 8 },
+    qtyBtn: {
+      width: 40,
+      height: 40,
+      borderRadius: 12,
+      border: "1px solid rgba(255,255,255,0.16)",
+      background: "rgba(255,255,255,0.06)",
+      color: "#e9e9ff",
+      fontWeight: 900,
+      fontSize: 18,
+      cursor: "pointer",
+    },
+
+    payRow: { display: "flex", gap: 10 },
+    payBtn: (active: boolean): React.CSSProperties => ({
+      flex: 1,
+      padding: "12px 12px",
+      borderRadius: 16,
+      border: active ? "1px solid rgba(0,255,200,0.55)" : "1px solid rgba(255,255,255,0.12)",
+      background: active ? "linear-gradient(135deg, rgba(0,255,200,0.18), rgba(0,120,255,0.10))" : "rgba(255,255,255,0.05)",
+      color: "#e9e9ff",
+      fontWeight: 900,
+      cursor: "pointer",
+      touchAction: "manipulation",
+    }),
+
+    footerActions: (narrow: boolean): React.CSSProperties => ({
+      display: "grid",
+      gridTemplateColumns: narrow ? "1fr" : "1fr 1fr",
+      gap: 10,
+    }),
+
+    bigCheckout: {
+      gridColumn: "1 / -1",
+      padding: "14px 14px",
+      borderRadius: 18,
+      border: "1px solid rgba(0,255,200,0.45)",
+      background: "linear-gradient(135deg, rgba(0,255,200,0.24), rgba(120,0,255,0.18))",
+      color: "#eafffb",
+      fontWeight: 950,
+      fontSize: 18,
+      cursor: "pointer",
+      opacity: checkoutLoading ? 0.6 : 1,
+      touchAction: "manipulation",
+    },
+
+    hint: { opacity: 0.75, fontSize: 13, lineHeight: 1.35 },
+
+    modalOverlay: {
+      position: "fixed",
+      inset: 0,
+      background: "rgba(0,0,0,0.55)",
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "center",
+      padding: 16,
+      zIndex: 100,
+    },
+    modal: {
+      width: "min(900px, 100%)",
+      borderRadius: 18,
+      border: "1px solid rgba(255,255,255,0.10)",
+      background: "rgba(12,12,28,0.92)",
+      boxShadow: "0 18px 60px rgba(0,0,0,0.55)",
+      overflow: "hidden",
+    },
+    modalHeader: {
+      padding: 14,
+      borderBottom: "1px solid rgba(255,255,255,0.08)",
+      display: "flex",
+      justifyContent: "space-between",
+      alignItems: "center",
+      gap: 10,
+      flexWrap: "wrap",
+    },
+    tabs: { display: "flex", gap: 8, padding: 14, borderBottom: "1px solid rgba(255,255,255,0.08)", flexWrap: "wrap" },
+    tabBtn: (active: boolean): React.CSSProperties => ({
+      padding: "10px 12px",
+      borderRadius: 14,
+      border: active ? "1px solid rgba(0,255,200,0.55)" : "1px solid rgba(255,255,255,0.12)",
+      background: active ? "rgba(0,255,200,0.12)" : "rgba(255,255,255,0.06)",
+      color: "#e9e9ff",
+      fontWeight: 900,
+      cursor: "pointer",
+    }),
+    modalBody: { padding: 14, display: "grid", gap: 12 },
+    input: {
+      width: "100%",
+      padding: "12px 12px",
+      borderRadius: 14,
+      border: "1px solid rgba(255,255,255,0.14)",
+      background: "rgba(255,255,255,0.06)",
+      color: "#e9e9ff",
+      fontWeight: 800,
+      outline: "none",
+      fontSize: 16,
+    },
+
+    table: {
+      width: "100%",
+      borderCollapse: "separate",
+      borderSpacing: 0,
+      overflow: "hidden",
+      border: "1px solid rgba(255,255,255,0.10)",
+      borderRadius: 16,
+      background: "rgba(255,255,255,0.04)",
+    },
+    th: { textAlign: "left", padding: 10, borderBottom: "1px solid rgba(255,255,255,0.08)", opacity: 0.85 },
+    td: { padding: 10, borderBottom: "1px solid rgba(255,255,255,0.06)" },
+  };
+
+  // ====== Daten laden ======
   useEffect(() => {
     (async () => {
       setLoadingBars(true);
@@ -194,7 +474,6 @@ function KassaPage() {
     })();
   }, []);
 
-  // Produkte je Bar laden
   useEffect(() => {
     if (!selectedBarId) {
       setProducts([]);
@@ -219,6 +498,7 @@ function KassaPage() {
     })();
   }, [selectedBarId]);
 
+  // ====== UI Actions ======
   function chooseBar(id: string) {
     localStorage.setItem(STORAGE_KEY_BAR, id);
     setSelectedBarId(id);
@@ -228,7 +508,6 @@ function KassaPage() {
     setQrDataUrl(null);
     setError(null);
   }
-
   function resetBar() {
     localStorage.removeItem(STORAGE_KEY_BAR);
     setSelectedBarId(null);
@@ -271,6 +550,7 @@ function KassaPage() {
     setCart({});
   }
 
+  // ====== Print-Text (Netto oben / Brutto unten) ======
   function buildReceiptText(args: {
     barName: string;
     receiptNo: string;
@@ -291,15 +571,47 @@ function KassaPage() {
 
     const body = args.lines.map((l) => `${l.qty}x ${l.name}  ${euro(l.lineTotal)}\n`).join("");
 
+    // ✅ Netto oben, Brutto unten
     const foot =
       `-----------------------------\n` +
-      `BRUTTO  ${euro(args.gross)}\n` +
+      `NETTO   ${euro(args.net)}\n` +
       `USt 20% ${euro(args.tax)}\n` +
-      `NETTO   ${euro(args.net)}\n`;
+      `BRUTTO  ${euro(args.gross)}\n`;
 
     return head + body + foot;
   }
 
+  // ====== Login ======
+  async function doLogin() {
+    try {
+      setLoginMsg(null);
+      setLoginLoading(true);
+
+      const auth = await checkPin(loginPin);
+      if (!auth) {
+        setLoginMsg("Falscher PIN.");
+        return;
+      }
+
+      setStaff(auth);
+      saveStaffSession(auth);
+      setLoginPin("");
+      setLoginMsg(null);
+    } finally {
+      setLoginLoading(false);
+    }
+  }
+
+  function doLogout() {
+    setStaff(null);
+    clearStaffSession();
+    setCart({});
+    setLastReceipt(null);
+    setQrDataUrl(null);
+    setError(null);
+  }
+
+  // ====== Checkout ======
   async function doCheckout(printRequested: boolean) {
     try {
       setError(null);
@@ -312,18 +624,17 @@ function KassaPage() {
 
       const deviceId = getDeviceId();
 
-      
+      // ✅ Robust: RPC liefert meist ein Array zurück
       const { data: seqRows, error: seqErr } = await supabase.rpc("next_receipt", { p_event_id: EVENT_ID });
-if (seqErr) throw new Error(seqErr.message);
+      if (seqErr) throw new Error(seqErr.message);
 
-const row = Array.isArray(seqRows) ? seqRows[0] : seqRows;
-if (!row?.receipt_no || !row?.short_no) {
-  throw new Error("next_receipt() hat keine Bon-Nummer geliefert. Prüfe event_counters / RPC.");
-}
+      const row = Array.isArray(seqRows) ? seqRows[0] : (seqRows as any);
+      if (!row?.receipt_no || !row?.short_no) {
+        throw new Error("next_receipt() hat keine Bon-Nummer geliefert. Prüfe event_counters / RPC.");
+      }
 
-const receiptNo = row.receipt_no as string;
-const shortNo = row.short_no as number;
-
+      const receiptNo = row.receipt_no as string;
+      const shortNo = row.short_no as number;
 
       const publicToken = randomToken(40);
       const createdAtISO = new Date().toISOString();
@@ -334,21 +645,27 @@ const shortNo = row.short_no as number;
           event_id: EVENT_ID,
           bar_id: selectedBarId,
           device_id: deviceId,
-          cashier_user_id: null, // legacy, wenn vorhanden
+
+          cashier_user_id: null, // falls legacy existiert
           cashier_staff_id: staff.id,
           cashier_name_snapshot: staff.name,
           cashier_role_snapshot: staff.role,
+
           receipt_no: receiptNo,
           short_no: shortNo,
           public_token: publicToken,
+
           payment_method: paymentMethod,
           status: "completed",
+
           gross_total: grossTotal,
-          tax_rate: 0.2,
+          tax_rate: VAT_RATE,
           tax_total: taxTotal,
           net_total: netTotal,
+
           receipt_offered: true,
           receipt_printed: printRequested ? true : false,
+
           created_at: createdAtISO,
         })
         .select("id")
@@ -417,7 +734,7 @@ const shortNo = row.short_no as number;
     }
   }
 
-  // Mitarbeiter-Storno: staff oder admin PIN, ohne Grund, nur letzter Bon
+  // ====== Mitarbeiter-Storno (letzter Bon) ======
   async function voidLastReceiptNoReason() {
     try {
       setVoidMsg(null);
@@ -449,6 +766,7 @@ const shortNo = row.short_no as number;
     }
   }
 
+  // ====== Admin ======
   function openAdmin() {
     setAdminMsg(null);
     setAdminTab("void");
@@ -459,7 +777,6 @@ const shortNo = row.short_no as number;
     setAdminPinInput("");
     setAdminOpen(false);
   }
-
   async function unlockAdmin() {
     setAdminMsg(null);
     const auth = await checkPin(adminPinInput);
@@ -472,201 +789,11 @@ const shortNo = row.short_no as number;
       setAdminMsg("Kein Admin-PIN.");
     }
   }
-
   function lockAdmin() {
     setAdminUnlocked(false);
     setAdminUser(null);
     setAdminMsg("Admin gesperrt.");
   }
-
-
-
-
-  // ✅ styles: CSSProperties + functions → any
-  const styles: Record<string, any> = {
-    page: {
-      minHeight: "100vh",
-      background:
-        "radial-gradient(1200px 600px at 20% 10%, rgba(120, 0, 255, 0.25), transparent 55%)," +
-        "radial-gradient(900px 500px at 85% 20%, rgba(0, 255, 200, 0.18), transparent 55%)," +
-        "radial-gradient(900px 700px at 60% 90%, rgba(0, 120, 255, 0.12), transparent 60%)," +
-        "linear-gradient(180deg, #050510 0%, #07071a 35%, #04040c 100%)",
-      color: "#e9e9ff",
-      fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif",
-    },
-    topbar: {
-      position: "sticky",
-      top: 0,
-      zIndex: 10,
-      backdropFilter: "blur(10px)",
-      background: "rgba(5,5,16,0.6)",
-      borderBottom: "1px solid rgba(255,255,255,0.08)",
-    },
-    topbarInner: {
-      maxWidth: 1280,
-      margin: "0 auto",
-      padding: "14px 16px",
-      display: "flex",
-      alignItems: "center",
-      justifyContent: "space-between",
-      gap: 12,
-    },
-    brand: { display: "flex", flexDirection: "column", lineHeight: 1.05 },
-    title: { margin: 0, fontWeight: 900, letterSpacing: 1.2, textTransform: "uppercase", fontSize: 18 },
-    subtitle: { margin: "4px 0 0 0", opacity: 0.75, fontSize: 13, letterSpacing: 0.4 },
-    layout: { maxWidth: 1280, margin: "0 auto", padding: 16, display: "grid", gridTemplateColumns: "1fr 380px", gap: 16 },
-    card: {
-      borderRadius: 18,
-      border: "1px solid rgba(255,255,255,0.10)",
-      background: "rgba(12,12,28,0.55)",
-      boxShadow: "0 12px 40px rgba(0,0,0,0.35), inset 0 1px 0 rgba(255,255,255,0.06)",
-      overflow: "hidden",
-    },
-    cardHeader: {
-      padding: "14px 14px",
-      borderBottom: "1px solid rgba(255,255,255,0.08)",
-      display: "flex",
-      alignItems: "center",
-      justifyContent: "space-between",
-      gap: 10,
-    },
-    cardHeaderTitle: { margin: 0, fontSize: 16, fontWeight: 900, letterSpacing: 0.6, textTransform: "uppercase" },
-    pill: {
-      display: "inline-flex",
-      alignItems: "center",
-      gap: 8,
-      padding: "8px 10px",
-      borderRadius: 999,
-      border: "1px solid rgba(255,255,255,0.12)",
-      background: "rgba(255,255,255,0.05)",
-      fontWeight: 800,
-      fontSize: 13,
-      whiteSpace: "nowrap",
-    },
-    subtleBtn: {
-      padding: "10px 12px",
-      borderRadius: 14,
-      border: "1px solid rgba(255,255,255,0.12)",
-      background: "rgba(255,255,255,0.06)",
-      color: "#e9e9ff",
-      fontWeight: 800,
-      cursor: "pointer",
-    },
-    dangerBtn: {
-      padding: "10px 12px",
-      borderRadius: 14,
-      border: "1px solid rgba(255,80,80,0.35)",
-      background: "rgba(255,80,80,0.12)",
-      color: "#ffecec",
-      fontWeight: 900,
-      cursor: "pointer",
-    },
-    barRow: { display: "flex", gap: 10, flexWrap: "wrap", padding: 14 },
-    barBtn: (active: boolean): React.CSSProperties => ({
-      padding: "12px 14px",
-      borderRadius: 16,
-      border: active ? "1px solid rgba(0,255,200,0.55)" : "1px solid rgba(255,255,255,0.12)",
-      background: active ? "linear-gradient(135deg, rgba(0,255,200,0.18), rgba(120,0,255,0.15))" : "rgba(255,255,255,0.05)",
-      color: active ? "#eafffb" : "#e9e9ff",
-      fontSize: 16,
-      fontWeight: 900,
-      cursor: "pointer",
-    }),
-    productsGrid: { padding: 14, display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))", gap: 12 },
-    productCard: {
-      borderRadius: 18,
-      border: "1px solid rgba(255,255,255,0.10)",
-      background: "rgba(10,10,22,0.65)",
-      boxShadow: "0 10px 30px rgba(0,0,0,0.35)",
-      padding: 14,
-      cursor: "pointer",
-      userSelect: "none",
-    },
-    productName: { fontSize: 18, fontWeight: 900, marginBottom: 10 },
-    productPrice: { fontSize: 16, opacity: 0.9, fontWeight: 800 },
-    rightInner: { padding: 14, display: "flex", flexDirection: "column", gap: 12 },
-    totals: { padding: 12, borderRadius: 16, border: "1px solid rgba(255,255,255,0.10)", background: "rgba(255,255,255,0.04)", display: "grid", gap: 8 },
-    totalRow: { display: "flex", justifyContent: "space-between", gap: 10, fontWeight: 800, opacity: 0.95 },
-    cartLine: { display: "grid", gridTemplateColumns: "1fr auto", gap: 10, padding: "10px 10px", borderRadius: 14, border: "1px solid rgba(255,255,255,0.10)", background: "rgba(255,255,255,0.04)" },
-    qtyControls: { display: "flex", alignItems: "center", gap: 8 },
-    qtyBtn: { width: 40, height: 40, borderRadius: 12, border: "1px solid rgba(255,255,255,0.16)", background: "rgba(255,255,255,0.06)", color: "#e9e9ff", fontWeight: 900, fontSize: 18, cursor: "pointer" },
-    payRow: { display: "flex", gap: 10 },
-    payBtn: (active: boolean): React.CSSProperties => ({
-      flex: 1,
-      padding: "12px 12px",
-      borderRadius: 16,
-      border: active ? "1px solid rgba(0,255,200,0.55)" : "1px solid rgba(255,255,255,0.12)",
-      background: active ? "linear-gradient(135deg, rgba(0,255,200,0.18), rgba(0,120,255,0.10))" : "rgba(255,255,255,0.05)",
-      color: "#e9e9ff",
-      fontWeight: 900,
-      cursor: "pointer",
-    }),
-    footerActions: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 },
-    bigCheckout: {
-      gridColumn: "1 / -1",
-      padding: "14px 14px",
-      borderRadius: 18,
-      border: "1px solid rgba(0,255,200,0.45)",
-      background: "linear-gradient(135deg, rgba(0,255,200,0.24), rgba(120,0,255,0.18))",
-      color: "#eafffb",
-      fontWeight: 950,
-      fontSize: 18,
-      cursor: "pointer",
-      opacity: checkoutLoading ? 0.6 : 1,
-    },
-    hint: { opacity: 0.75, fontSize: 13, lineHeight: 1.35 },
-    modalOverlay: { position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)", display: "flex", alignItems: "center", justifyContent: "center", padding: 16, zIndex: 100 },
-    modal: { width: "min(900px, 100%)", borderRadius: 18, border: "1px solid rgba(255,255,255,0.10)", background: "rgba(12,12,28,0.92)", boxShadow: "0 18px 60px rgba(0,0,0,0.55)", overflow: "hidden" },
-    modalHeader: { padding: 14, borderBottom: "1px solid rgba(255,255,255,0.08)", display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 },
-    tabs: { display: "flex", gap: 8, padding: 14, borderBottom: "1px solid rgba(255,255,255,0.08)" },
-    tabBtn: (active: boolean): React.CSSProperties => ({
-      padding: "10px 12px",
-      borderRadius: 14,
-      border: active ? "1px solid rgba(0,255,200,0.55)" : "1px solid rgba(255,255,255,0.12)",
-      background: active ? "rgba(0,255,200,0.12)" : "rgba(255,255,255,0.06)",
-      color: "#e9e9ff",
-      fontWeight: 900,
-      cursor: "pointer",
-    }),
-    modalBody: { padding: 14, display: "grid", gap: 12 },
-    input: { width: "100%", padding: "12px 12px", borderRadius: 14, border: "1px solid rgba(255,255,255,0.14)", background: "rgba(255,255,255,0.06)", color: "#e9e9ff", fontWeight: 800, outline: "none", fontSize: 16 },
-    table: { width: "100%", borderCollapse: "separate", borderSpacing: 0, overflow: "hidden", border: "1px solid rgba(255,255,255,0.10)", borderRadius: 16, background: "rgba(255,255,255,0.04)" },
-    th: { textAlign: "left", padding: 10, borderBottom: "1px solid rgba(255,255,255,0.08)", opacity: 0.85 },
-    td: { padding: 10, borderBottom: "1px solid rgba(255,255,255,0.06)" },
-  };
-
-  async function doLogin() {
-    try {
-      setLoginMsg(null);
-      setLoginLoading(true);
-
-      const auth = await checkPin(loginPin);
-      if (!auth) {
-        setLoginMsg("Falscher PIN.");
-        return;
-      }
-
-      setStaff(auth);
-      saveStaffSession(auth);
-      setLoginPin("");
-      setLoginMsg(null);
-    } finally {
-      setLoginLoading(false);
-    }
-  }
-
-  function doLogout() {
-    setStaff(null);
-    clearStaffSession();
-    setCart({});
-    setLastReceipt(null);
-    setQrDataUrl(null);
-    setError(null);
-    // Bar Auswahl lassen wir bewusst gespeichert (damit Gerät an einer Bar bleibt)
-  }
-
-  // Admin UI
-  // (Removed duplicate unlockAdmin, lockAdmin, openAdmin, closeAdmin)
 
   async function adminVoidByReceipt() {
     try {
@@ -684,6 +811,7 @@ const shortNo = row.short_no as number;
       if ((o as any).status === "voided") return void setAdminMsg("Dieser Bon ist bereits storniert.");
 
       const nowIso = new Date().toISOString();
+
       const { error: uErr } = await supabase.from("orders").update({ status: "voided", voided_at: nowIso }).eq("id", (o as any).id);
       if (uErr) throw new Error(uErr.message);
 
@@ -743,7 +871,6 @@ const shortNo = row.short_no as number;
     }
   }
 
-  // Report
   async function loadReport(range: "all" | "today") {
     try {
       setReportLoading(true);
@@ -805,7 +932,7 @@ const shortNo = row.short_no as number;
     }
   }
 
-  // ⭐ Login-Gate: wenn nicht eingeloggt → Login Screen
+  // ====== LOGIN GATE ======
   if (!staff) {
     return (
       <div style={styles.page}>
@@ -845,27 +972,18 @@ const shortNo = row.short_no as number;
               </button>
 
               {loginMsg && <div style={{ ...styles.totals, color: "#ff8080", fontWeight: 900 }}>{loginMsg}</div>}
-
-              <div style={styles.totals}>
-                <div style={{ ...styles.totalRow, fontWeight: 950 }}>
-                  <span>Hinweis</span>
-                  <span>PIN = Storno-PIN</span>
-                </div>
-                <div style={styles.hint}>
-                  Wenn Geräte herumliegen, verhindert der Login, dass “irgendwer” Bestellungen tippt.
-                </div>
-              </div>
             </div>
           </div>
 
           <div style={{ marginTop: 12, opacity: 0.65, fontSize: 12 }}>
-            (Der Login wird pro Gerät gespeichert. Abmelden oben rechts, wenn Schichtwechsel ist.)
+            (Der Login wird pro Gerät gespeichert. Abmelden oben rechts bei Schichtwechsel.)
           </div>
         </div>
       </div>
     );
   }
 
+  // ====== MAIN UI ======
   return (
     <div style={styles.page}>
       <div style={styles.topbar}>
@@ -877,11 +995,13 @@ const shortNo = row.short_no as number;
             </p>
           </div>
 
-          <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+          <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
             <button style={styles.subtleBtn} onClick={openAdmin}>
               Admin {adminUnlocked ? `✓${adminUser?.name ? ` (${adminUser.name})` : ""}` : ""}
             </button>
-            <button style={styles.subtleBtn} onClick={doLogout}>Abmelden</button>
+            <button style={styles.subtleBtn} onClick={doLogout}>
+              Abmelden
+            </button>
             {selectedBar && (
               <button style={styles.subtleBtn} onClick={resetBar}>
                 Bar wechseln
@@ -891,7 +1011,7 @@ const shortNo = row.short_no as number;
         </div>
       </div>
 
-      <div style={styles.layout}>
+      <div style={styles.layout(isNarrow)}>
         {/* LEFT */}
         <div style={styles.card}>
           <div style={styles.cardHeader}>
@@ -913,7 +1033,7 @@ const shortNo = row.short_no as number;
             </div>
           ) : (
             <>
-              <div style={{ padding: 14, display: "flex", justifyContent: "space-between", gap: 12 }}>
+              <div style={{ padding: 14, display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
                 <div>
                   <div style={{ fontSize: 20, fontWeight: 950 }}>{selectedBar?.name}</div>
                   <div style={{ ...styles.hint, marginTop: 4 }}>Tippe ein Produkt, um es in den Warenkorb zu legen.</div>
@@ -1021,18 +1141,19 @@ const shortNo = row.short_no as number;
                   })}
                 </div>
 
+                {/* ✅ Netto oben, Brutto unten (Totals überall) */}
                 <div style={styles.totals}>
                   <div style={styles.totalRow}>
-                    <span>Brutto</span>
-                    <span>{euro(grossTotal)}</span>
+                    <span>Netto</span>
+                    <span>{euro(netTotal)}</span>
                   </div>
                   <div style={styles.totalRow}>
                     <span>USt 20%</span>
                     <span>{euro(taxTotal)}</span>
                   </div>
                   <div style={{ ...styles.totalRow, fontWeight: 950, fontSize: 16 }}>
-                    <span>Netto</span>
-                    <span>{euro(netTotal)}</span>
+                    <span>Brutto</span>
+                    <span>{euro(grossTotal)}</span>
                   </div>
                 </div>
 
@@ -1048,7 +1169,7 @@ const shortNo = row.short_no as number;
                   </div>
                 </div>
 
-                <div style={styles.footerActions}>
+                <div style={styles.footerActions(isNarrow)}>
                   <button style={styles.subtleBtn} onClick={clearCart}>
                     Abbrechen
                   </button>
@@ -1117,7 +1238,7 @@ const shortNo = row.short_no as number;
                 <div style={{ fontWeight: 950, letterSpacing: 0.6, textTransform: "uppercase" }}>Admin</div>
                 <div style={styles.hint}>Status: {adminUnlocked ? `entsperrt (${adminUser?.name ?? "Admin"})` : "gesperrt"}</div>
               </div>
-              <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+              <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
                 {adminUnlocked && (
                   <button style={styles.dangerBtn} onClick={lockAdmin}>
                     Sperren
@@ -1140,7 +1261,7 @@ const shortNo = row.short_no as number;
                 Abschluss
               </button>
 
-              <div style={{ marginLeft: "auto", display: "flex", gap: 10, alignItems: "center" }}>
+              <div style={{ marginLeft: "auto", display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
                 {!adminUnlocked && (
                   <>
                     <input
@@ -1204,24 +1325,26 @@ const shortNo = row.short_no as number;
                         <span>Gesamt</span>
                         <span>{reportTotals.bons} Bons</span>
                       </div>
+
+                      {/* ✅ Netto oben, Brutto unten */}
                       <div style={styles.totalRow}>
-                        <span>Brutto</span>
-                        <span>{euro(reportTotals.brutto)}</span>
+                        <span>Netto</span>
+                        <span>{euro(reportTotals.netto)}</span>
                       </div>
                       <div style={styles.totalRow}>
                         <span>USt 20%</span>
                         <span>{euro(reportTotals.ust)}</span>
                       </div>
                       <div style={{ ...styles.totalRow, fontWeight: 950 }}>
-                        <span>Netto</span>
-                        <span>{euro(reportTotals.netto)}</span>
+                        <span>Brutto</span>
+                        <span>{euro(reportTotals.brutto)}</span>
                       </div>
                     </div>
                   )}
 
                   {reportByBar.length > 0 && (
                     <div>
-                      <div style={{ fontWeight: 950, marginBottom: 8 }}>Umsatz pro Bar</div>
+                      <div style={{ fontWeight: 950, marginBottom: 8 }}>Umsatz pro Bar (Brutto)</div>
                       <table style={styles.table}>
                         <thead>
                           <tr>
@@ -1245,7 +1368,7 @@ const shortNo = row.short_no as number;
 
                   {reportByProduct.length > 0 && (
                     <div>
-                      <div style={{ fontWeight: 950, marginBottom: 8 }}>Top Produkte</div>
+                      <div style={{ fontWeight: 950, marginBottom: 8 }}>Top Produkte (Brutto)</div>
                       <table style={styles.table}>
                         <thead>
                           <tr>
@@ -1274,7 +1397,7 @@ const shortNo = row.short_no as number;
       )}
 
       <div style={{ maxWidth: 1280, margin: "0 auto", padding: "0 16px 16px 16px", opacity: 0.6, fontSize: 12 }}>
-        Login + Storno PIN via RPC <b>check_staff_pin</b> • Bestellungen speichern Kassier: <b>{staff.name}</b>
+        UI responsive • Totals: Netto oben / Brutto unten • Login+Storno via RPC <b>check_staff_pin</b>
       </div>
     </div>
   );
@@ -1361,9 +1484,10 @@ function ReceiptPage() {
               {`-----------------------------\n`}
               {items.map((it) => `${it.qty}x ${it.name_snapshot}  ${euro(Number(it.line_total_gross))}\n`).join("")}
               {`-----------------------------\n`}
-              {`BRUTTO  ${euro(Number(order.gross_total))}\n`}
-              {`USt 20% ${euro(Number(order.tax_total))}\n`}
+              {/* ✅ Netto oben, Brutto unten */}
               {`NETTO   ${euro(Number(order.net_total))}\n`}
+              {`USt 20% ${euro(Number(order.tax_total))}\n`}
+              {`BRUTTO  ${euro(Number(order.gross_total))}\n`}
             </div>
           )}
         </div>
