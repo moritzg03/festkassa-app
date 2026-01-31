@@ -52,6 +52,7 @@ type ReceiptItemRow = {
 const EVENT_ID = "00000000-0000-0000-0000-000000000001";
 const STORAGE_KEY_BAR = "festkassa:selectedBarId";
 const STORAGE_KEY_DEVICE = "festkassa:deviceId";
+const STORAGE_KEY_STAFF = "festkassa:staffSession"; // JSON
 
 function euro(n: number) {
   return new Intl.NumberFormat("de-AT", { style: "currency", currency: "EUR" }).format(n);
@@ -85,7 +86,7 @@ function getReceiptTokenFromPath() {
 }
 
 /**
- * ✅ PIN-Check nur via RPC (DB-Hash, sicher)
+ * ✅ PIN-Check via RPC (Hash in DB)
  */
 async function checkPin(pin: string): Promise<StaffAuth | null> {
   const clean = pin.trim();
@@ -101,6 +102,25 @@ async function checkPin(pin: string): Promise<StaffAuth | null> {
   if (role !== "staff" && role !== "admin") return null;
 
   return { id: row.id, name: row.name, role };
+}
+
+function loadStaffSession(): StaffAuth | null {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY_STAFF);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed?.id || !parsed?.name || !parsed?.role) return null;
+    if (parsed.role !== "staff" && parsed.role !== "admin") return null;
+    return parsed as StaffAuth;
+  } catch {
+    return null;
+  }
+}
+function saveStaffSession(s: StaffAuth) {
+  localStorage.setItem(STORAGE_KEY_STAFF, JSON.stringify(s));
+}
+function clearStaffSession() {
+  localStorage.removeItem(STORAGE_KEY_STAFF);
 }
 
 export default function App() {
@@ -129,6 +149,12 @@ function KassaPage() {
   const [voidLoading, setVoidLoading] = useState(false);
   const [voidMsg, setVoidMsg] = useState<string | null>(null);
 
+  // ✅ Login
+  const [staff, setStaff] = useState<StaffAuth | null>(() => loadStaffSession());
+  const [loginPin, setLoginPin] = useState("");
+  const [loginLoading, setLoginLoading] = useState(false);
+  const [loginMsg, setLoginMsg] = useState<string | null>(null);
+
   // Admin
   const [adminOpen, setAdminOpen] = useState(false);
   const [adminUnlocked, setAdminUnlocked] = useState(false);
@@ -151,8 +177,7 @@ function KassaPage() {
   const cartLines = useMemo(() => Object.values(cart), [cart]);
 
   const grossTotal = useMemo(() => round2(cartLines.reduce((s, l) => s + Number(l.product.price_gross) * l.qty, 0)), [cartLines]);
-  // Getränke (AT): 20% USt → aus Bruttopreis: tax = gross * 20/120
-  const taxTotal = useMemo(() => round2(grossTotal * (20 / 120)), [grossTotal]);
+  const taxTotal = useMemo(() => round2(grossTotal * (20 / 120)), [grossTotal]); // 20% aus Bruttopreis
   const netTotal = useMemo(() => round2(grossTotal - taxTotal), [grossTotal, taxTotal]);
 
   // Bars laden
@@ -260,6 +285,7 @@ function KassaPage() {
       `*** ${args.barName.toUpperCase()} ***\n` +
       `Bon-Nr: ${args.receiptNo}\n` +
       `${new Date(args.createdAtISO).toLocaleString("de-AT")}\n` +
+      `Kassier: ${staff ? `${staff.name} (${staff.role})` : "—"}\n` +
       `Zahlung: ${args.payment === "sumup" ? "Karte (SumUp)" : "Bar"}\n` +
       `-----------------------------\n`;
 
@@ -278,6 +304,7 @@ function KassaPage() {
     try {
       setError(null);
 
+      if (!staff) return void setError("Bitte zuerst einloggen.");
       if (!selectedBarId || !selectedBar) return void setError("Bitte zuerst die Bar auswählen.");
       if (cartLines.length === 0) return void setError("Warenkorb ist leer.");
 
@@ -285,24 +312,32 @@ function KassaPage() {
 
       const deviceId = getDeviceId();
 
-      // Fortlaufende Nummer
-      const { data: seq, error: seqErr } = await supabase.rpc("next_receipt", { p_event_id: EVENT_ID });
-      if (seqErr) throw new Error(seqErr.message);
+      
+      const { data: seqRows, error: seqErr } = await supabase.rpc("next_receipt", { p_event_id: EVENT_ID });
+if (seqErr) throw new Error(seqErr.message);
 
-      const receiptNo = (seq as any).receipt_no as string;
-      const shortNo = (seq as any).short_no as number;
+const row = Array.isArray(seqRows) ? seqRows[0] : seqRows;
+if (!row?.receipt_no || !row?.short_no) {
+  throw new Error("next_receipt() hat keine Bon-Nummer geliefert. Prüfe event_counters / RPC.");
+}
+
+const receiptNo = row.receipt_no as string;
+const shortNo = row.short_no as number;
+
 
       const publicToken = randomToken(40);
       const createdAtISO = new Date().toISOString();
 
-      // Order speichern
       const { data: order, error: oErr } = await supabase
         .from("orders")
         .insert({
           event_id: EVENT_ID,
           bar_id: selectedBarId,
           device_id: deviceId,
-          cashier_user_id: null,
+          cashier_user_id: null, // legacy, wenn vorhanden
+          cashier_staff_id: staff.id,
+          cashier_name_snapshot: staff.name,
+          cashier_role_snapshot: staff.role,
           receipt_no: receiptNo,
           short_no: shortNo,
           public_token: publicToken,
@@ -321,7 +356,6 @@ function KassaPage() {
 
       if (oErr) throw new Error(oErr.message);
 
-      // Items speichern
       const itemsRows = cartLines.map((l) => ({
         order_id: (order as any).id,
         product_id: l.product.id,
@@ -334,7 +368,6 @@ function KassaPage() {
       const { error: iErr } = await supabase.from("order_items").insert(itemsRows);
       if (iErr) throw new Error(iErr.message);
 
-      // Print-Job (optional)
       if (printRequested) {
         const payload = buildReceiptText({
           barName: selectedBar.name,
@@ -397,11 +430,7 @@ function KassaPage() {
 
       const nowIso = new Date().toISOString();
 
-      const { error: uErr } = await supabase
-        .from("orders")
-        .update({ status: "voided", voided_at: nowIso })
-        .eq("id", lastReceipt.order_id);
-
+      const { error: uErr } = await supabase.from("orders").update({ status: "voided", voided_at: nowIso }).eq("id", lastReceipt.order_id);
       if (uErr) throw new Error(uErr.message);
 
       const { error: vErr } = await supabase.from("voids").insert({
@@ -409,7 +438,6 @@ function KassaPage() {
         voided_by: `${auth.role}:${auth.name}`,
         reason: "",
       });
-
       if (vErr) throw new Error(vErr.message);
 
       setVoidMsg(`Storno ok: ${lastReceipt.receipt_no}`);
@@ -461,13 +489,7 @@ function KassaPage() {
       if (!r) return void setAdminMsg("Bitte Bon-Nr eingeben.");
       if (!reason) return void setAdminMsg("Bitte Storno-Grund eingeben.");
 
-      const { data: o, error: oErr } = await supabase
-        .from("orders")
-        .select("id,status")
-        .eq("event_id", EVENT_ID)
-        .eq("receipt_no", r)
-        .single();
-
+      const { data: o, error: oErr } = await supabase.from("orders").select("id,status").eq("event_id", EVENT_ID).eq("receipt_no", r).single();
       if (oErr) throw new Error(oErr.message);
       if (!o) throw new Error("Bon nicht gefunden.");
       if ((o as any).status === "voided") return void setAdminMsg("Dieser Bon ist bereits storniert.");
@@ -507,11 +529,7 @@ function KassaPage() {
       if (oErr) throw new Error(oErr.message);
       if (!o) throw new Error("Bon nicht gefunden.");
 
-      const { data: it, error: iErr } = await supabase
-        .from("order_items")
-        .select("name_snapshot,qty,line_total_gross")
-        .eq("order_id", (o as any).id);
-
+      const { data: it, error: iErr } = await supabase.from("order_items").select("name_snapshot,qty,line_total_gross").eq("order_id", (o as any).id);
       if (iErr) throw new Error(iErr.message);
 
       const barName = bars.find((b) => b.id === (o as any).bar_id)?.name ?? "Bar";
@@ -527,12 +545,7 @@ function KassaPage() {
         net: Number((o as any).net_total),
       });
 
-      const { error: pErr } = await supabase.from("print_jobs").insert({
-        event_id: EVENT_ID,
-        order_id: (o as any).id,
-        payload,
-        status: "queued",
-      });
+      const { error: pErr } = await supabase.from("print_jobs").insert({ event_id: EVENT_ID, order_id: (o as any).id, payload, status: "queued" });
       if (pErr) throw new Error(pErr.message);
 
       setAdminMsg(`Reprint queued: ${r}`);
@@ -552,11 +565,7 @@ function KassaPage() {
 
       if (!adminUnlocked) return void setReportError("Bitte Admin entsperren.");
 
-      let q = supabase
-        .from("orders")
-        .select("id,bar_id,gross_total,tax_total,net_total,created_at,status")
-        .eq("event_id", EVENT_ID)
-        .eq("status", "completed");
+      let q = supabase.from("orders").select("id,bar_id,gross_total,tax_total,net_total,created_at,status").eq("event_id", EVENT_ID).eq("status", "completed");
 
       if (range === "today") {
         const start = new Date();
@@ -587,11 +596,7 @@ function KassaPage() {
 
       const ids = (orders ?? []).map((o: any) => o.id);
       if (ids.length) {
-        const { data: items, error: iErr } = await supabase
-          .from("order_items")
-          .select("order_id,name_snapshot,qty,line_total_gross")
-          .in("order_id", ids);
-
+        const { data: items, error: iErr } = await supabase.from("order_items").select("order_id,name_snapshot,qty,line_total_gross").in("order_id", ids);
         if (iErr) throw new Error(iErr.message);
 
         const prodMap = new Map<string, { produkt: string; menge: number; brutto: number }>();
@@ -611,7 +616,7 @@ function KassaPage() {
     }
   }
 
-  // ✅ styles: enthält CSSProperties UND Funktionen, daher any (TS-sicher)
+  // ✅ styles: CSSProperties + functions → any
   const styles: Record<string, any> = {
     page: {
       minHeight: "100vh",
@@ -764,20 +769,279 @@ function KassaPage() {
     td: { padding: 10, borderBottom: "1px solid rgba(255,255,255,0.06)" },
   };
 
+  async function doLogin() {
+    try {
+      setLoginMsg(null);
+      setLoginLoading(true);
+
+      const auth = await checkPin(loginPin);
+      if (!auth) {
+        setLoginMsg("Falscher PIN.");
+        return;
+      }
+
+      setStaff(auth);
+      saveStaffSession(auth);
+      setLoginPin("");
+      setLoginMsg(null);
+    } finally {
+      setLoginLoading(false);
+    }
+  }
+
+  function doLogout() {
+    setStaff(null);
+    clearStaffSession();
+    setCart({});
+    setLastReceipt(null);
+    setQrDataUrl(null);
+    setError(null);
+    // Bar Auswahl lassen wir bewusst gespeichert (damit Gerät an einer Bar bleibt)
+  }
+
+  // Admin UI
+  async function unlockAdmin() {
+    setAdminMsg(null);
+    const auth = await checkPin(adminPinInput);
+    if (auth?.role === "admin") {
+      setAdminUnlocked(true);
+      setAdminUser(auth);
+      setAdminMsg(`Admin entsperrt (${auth.name}).`);
+      setAdminPinInput("");
+    } else {
+      setAdminMsg("Kein Admin-PIN.");
+    }
+  }
+  function lockAdmin() {
+    setAdminUnlocked(false);
+    setAdminUser(null);
+    setAdminMsg("Admin gesperrt.");
+  }
+  function openAdmin() {
+    setAdminMsg(null);
+    setAdminTab("void");
+    setAdminOpen(true);
+  }
+  function closeAdmin() {
+    setAdminMsg(null);
+    setAdminPinInput("");
+    setAdminOpen(false);
+  }
+
+  async function adminVoidByReceipt() {
+    try {
+      setAdminMsg(null);
+      if (!adminUnlocked) return void setAdminMsg("Bitte zuerst Admin entsperren.");
+
+      const r = voidReceiptNo.trim();
+      const reason = voidReason.trim();
+      if (!r) return void setAdminMsg("Bitte Bon-Nr eingeben.");
+      if (!reason) return void setAdminMsg("Bitte Storno-Grund eingeben.");
+
+      const { data: o, error: oErr } = await supabase.from("orders").select("id,status").eq("event_id", EVENT_ID).eq("receipt_no", r).single();
+      if (oErr) throw new Error(oErr.message);
+      if (!o) throw new Error("Bon nicht gefunden.");
+      if ((o as any).status === "voided") return void setAdminMsg("Dieser Bon ist bereits storniert.");
+
+      const nowIso = new Date().toISOString();
+      const { error: uErr } = await supabase.from("orders").update({ status: "voided", voided_at: nowIso }).eq("id", (o as any).id);
+      if (uErr) throw new Error(uErr.message);
+
+      const who = adminUser ? `${adminUser.role}:${adminUser.name}` : "admin";
+      const { error: vErr } = await supabase.from("voids").insert({ order_id: (o as any).id, voided_by: who, reason });
+      if (vErr) throw new Error(vErr.message);
+
+      setAdminMsg(`Storno ok: ${r}`);
+      setVoidReceiptNo("");
+      setVoidReason("");
+    } catch (e: any) {
+      setAdminMsg(`Fehler: ${e?.message ?? String(e)}`);
+    }
+  }
+
+  async function adminReprintByReceipt() {
+    try {
+      setAdminMsg(null);
+      if (!adminUnlocked) return void setAdminMsg("Bitte zuerst Admin entsperren.");
+
+      const r = reprintReceiptNo.trim();
+      if (!r) return void setAdminMsg("Bitte Bon-Nr eingeben.");
+
+      const { data: o, error: oErr } = await supabase
+        .from("orders")
+        .select("id,bar_id,receipt_no,created_at,payment_method,gross_total,tax_total,net_total")
+        .eq("event_id", EVENT_ID)
+        .eq("receipt_no", r)
+        .single();
+
+      if (oErr) throw new Error(oErr.message);
+      if (!o) throw new Error("Bon nicht gefunden.");
+
+      const { data: it, error: iErr } = await supabase.from("order_items").select("name_snapshot,qty,line_total_gross").eq("order_id", (o as any).id);
+      if (iErr) throw new Error(iErr.message);
+
+      const barName = bars.find((b) => b.id === (o as any).bar_id)?.name ?? "Bar";
+
+      const payload = buildReceiptText({
+        barName,
+        receiptNo: (o as any).receipt_no,
+        createdAtISO: (o as any).created_at,
+        payment: (o as any).payment_method,
+        lines: (it ?? []).map((x: any) => ({ qty: x.qty, name: x.name_snapshot, lineTotal: Number(x.line_total_gross) })),
+        gross: Number((o as any).gross_total),
+        tax: Number((o as any).tax_total),
+        net: Number((o as any).net_total),
+      });
+
+      const { error: pErr } = await supabase.from("print_jobs").insert({ event_id: EVENT_ID, order_id: (o as any).id, payload, status: "queued" });
+      if (pErr) throw new Error(pErr.message);
+
+      setAdminMsg(`Reprint queued: ${r}`);
+      setReprintReceiptNo("");
+    } catch (e: any) {
+      setAdminMsg(`Fehler: ${e?.message ?? String(e)}`);
+    }
+  }
+
+  // Report
+  async function loadReport(range: "all" | "today") {
+    try {
+      setReportLoading(true);
+      setReportError(null);
+      setReportTotals(null);
+      setReportByBar([]);
+      setReportByProduct([]);
+
+      if (!adminUnlocked) return void setReportError("Bitte Admin entsperren.");
+
+      let q = supabase.from("orders").select("id,bar_id,gross_total,tax_total,net_total,created_at,status").eq("event_id", EVENT_ID).eq("status", "completed");
+
+      if (range === "today") {
+        const start = new Date();
+        start.setHours(0, 0, 0, 0);
+        q = q.gte("created_at", start.toISOString());
+      }
+
+      const { data: orders, error: oErr } = await q;
+      if (oErr) throw new Error(oErr.message);
+
+      const totals = {
+        brutto: round2((orders ?? []).reduce((s: number, o: any) => s + Number(o.gross_total), 0)),
+        ust: round2((orders ?? []).reduce((s: number, o: any) => s + Number(o.tax_total), 0)),
+        netto: round2((orders ?? []).reduce((s: number, o: any) => s + Number(o.net_total), 0)),
+        bons: (orders ?? []).length,
+      };
+      setReportTotals(totals);
+
+      const barMap = new Map<string, { bar: string; brutto: number; bons: number }>();
+      for (const o of orders ?? []) {
+        const barName = bars.find((b) => b.id === (o as any).bar_id)?.name ?? "Unbekannt";
+        const ex = barMap.get(barName) ?? { bar: barName, brutto: 0, bons: 0 };
+        ex.brutto = round2(ex.brutto + Number((o as any).gross_total));
+        ex.bons += 1;
+        barMap.set(barName, ex);
+      }
+      setReportByBar(Array.from(barMap.values()).sort((a, b) => b.brutto - a.brutto));
+
+      const ids = (orders ?? []).map((o: any) => o.id);
+      if (ids.length) {
+        const { data: items, error: iErr } = await supabase.from("order_items").select("order_id,name_snapshot,qty,line_total_gross").in("order_id", ids);
+        if (iErr) throw new Error(iErr.message);
+
+        const prodMap = new Map<string, { produkt: string; menge: number; brutto: number }>();
+        for (const it of items ?? []) {
+          const key = (it as any).name_snapshot as string;
+          const ex = prodMap.get(key) ?? { produkt: key, menge: 0, brutto: 0 };
+          ex.menge += Number((it as any).qty);
+          ex.brutto = round2(ex.brutto + Number((it as any).line_total_gross));
+          prodMap.set(key, ex);
+        }
+        setReportByProduct(Array.from(prodMap.values()).sort((a, b) => b.brutto - a.brutto));
+      }
+    } catch (e: any) {
+      setReportError(e?.message ?? String(e));
+    } finally {
+      setReportLoading(false);
+    }
+  }
+
+  // ⭐ Login-Gate: wenn nicht eingeloggt → Login Screen
+  if (!staff) {
+    return (
+      <div style={styles.page}>
+        <div style={styles.topbar}>
+          <div style={styles.topbarInner}>
+            <div style={styles.brand}>
+              <h1 style={styles.title}>Festkassa</h1>
+              <p style={styles.subtitle}>Login erforderlich (PIN)</p>
+            </div>
+          </div>
+        </div>
+
+        <div style={{ maxWidth: 560, margin: "0 auto", padding: 16 }}>
+          <div style={styles.card}>
+            <div style={styles.cardHeader}>
+              <h2 style={styles.cardHeaderTitle}>Mitarbeiter Login</h2>
+              {selectedBarId && <span style={styles.pill}>Bar gespeichert</span>}
+            </div>
+
+            <div style={{ padding: 14, display: "grid", gap: 12 }}>
+              <div style={styles.hint}>PIN eingeben. Danach kannst du Bestellungen bonieren und Stornos machen.</div>
+
+              <input
+                style={styles.input}
+                placeholder="PIN"
+                value={loginPin}
+                onChange={(e) => setLoginPin(e.target.value)}
+                inputMode="numeric"
+                type="password"
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") doLogin();
+                }}
+              />
+
+              <button style={styles.subtleBtn} onClick={doLogin} disabled={loginLoading}>
+                {loginLoading ? "Prüfe…" : "Einloggen"}
+              </button>
+
+              {loginMsg && <div style={{ ...styles.totals, color: "#ff8080", fontWeight: 900 }}>{loginMsg}</div>}
+
+              <div style={styles.totals}>
+                <div style={{ ...styles.totalRow, fontWeight: 950 }}>
+                  <span>Hinweis</span>
+                  <span>PIN = Storno-PIN</span>
+                </div>
+                <div style={styles.hint}>
+                  Wenn Geräte herumliegen, verhindert der Login, dass “irgendwer” Bestellungen tippt.
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div style={{ marginTop: 12, opacity: 0.65, fontSize: 12 }}>
+            (Der Login wird pro Gerät gespeichert. Abmelden oben rechts, wenn Schichtwechsel ist.)
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div style={styles.page}>
       <div style={styles.topbar}>
         <div style={styles.topbarInner}>
           <div style={styles.brand}>
             <h1 style={styles.title}>Festkassa</h1>
-            <p style={styles.subtitle}>{selectedBar ? `Device-Bar: ${selectedBar.name}` : "Bar auswählen (einmalig pro Gerät)"}</p>
+            <p style={styles.subtitle}>
+              Eingeloggt: <b>{staff.name}</b> ({staff.role}) {selectedBar ? `• Bar: ${selectedBar.name}` : "• Bar auswählen"}
+            </p>
           </div>
 
           <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-            {selectedBar && <span style={styles.pill}>4 Bars • 1 Bon/Bestellung</span>}
             <button style={styles.subtleBtn} onClick={openAdmin}>
               Admin {adminUnlocked ? `✓${adminUser?.name ? ` (${adminUser.name})` : ""}` : ""}
             </button>
+            <button style={styles.subtleBtn} onClick={doLogout}>Abmelden</button>
             {selectedBar && (
               <button style={styles.subtleBtn} onClick={resetBar}>
                 Bar wechseln
@@ -990,7 +1254,7 @@ function KassaPage() {
             </div>
 
             <div style={styles.modalBody}>
-              <div style={styles.hint}>PIN von Mitarbeiter oder Admin eingeben (Grund nicht nötig).</div>
+              <div style={styles.hint}>PIN von Mitarbeiter oder Admin eingeben.</div>
 
               <input style={styles.input} placeholder="PIN" value={voidPin} onChange={(e) => setVoidPin(e.target.value)} inputMode="numeric" type="password" />
 
@@ -1170,7 +1434,7 @@ function KassaPage() {
       )}
 
       <div style={{ maxWidth: 1280, margin: "0 auto", padding: "0 16px 16px 16px", opacity: 0.6, fontSize: 12 }}>
-        PINs: Prüfung via RPC <b>check_staff_pin</b> (Hash in DB, keine Klartext-PINs)
+        Login + Storno PIN via RPC <b>check_staff_pin</b> • Bestellungen speichern Kassier: <b>{staff.name}</b>
       </div>
     </div>
   );
@@ -1199,11 +1463,7 @@ function ReceiptPage() {
 
         if (oErr) throw new Error(oErr.message);
 
-        const { data: it, error: iErr } = await supabase
-          .from("order_items")
-          .select("order_id,name_snapshot,qty,line_total_gross")
-          .eq("order_id", (o as any).id);
-
+        const { data: it, error: iErr } = await supabase.from("order_items").select("order_id,name_snapshot,qty,line_total_gross").eq("order_id", (o as any).id);
         if (iErr) throw new Error(iErr.message);
 
         setOrder(o as any);
