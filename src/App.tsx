@@ -58,8 +58,7 @@ const VAT_RATE = 0.2;
 
 // Pfand
 const DEPOSIT_VALUE = 0.5;
-const STORAGE_KEY_DEPOSIT_ENABLED = "festkassa:depositEnabled";
-const STORAGE_KEY_DEPOSIT_CUPS = "festkassa:depositCups";
+const STORAGE_KEY_DEPOSIT_RETURN_QTY = "festkassa:depositReturnQty";
 
 const STORAGE_KEY_BAR = "festkassa:selectedBarId";
 const STORAGE_KEY_DEVICE = "festkassa:deviceId";
@@ -166,15 +165,16 @@ function KassaPage() {
   const [cart, setCart] = useState<Record<string, CartLine>>({});
   const [paymentMethod, setPaymentMethod] = useState<"cash" | "sumup">("cash");
 
-  // ✅ Pfand: global, oben steuerbar
-  const [depositEnabled, setDepositEnabled] = useState<boolean>(() => localStorage.getItem(STORAGE_KEY_DEPOSIT_ENABLED) === "1");
-  const [depositCups, setDepositCups] = useState<number>(() => {
-    const raw = localStorage.getItem(STORAGE_KEY_DEPOSIT_CUPS);
+  // ✅ Pfand-Rückgabe (als “Produkt”-Kachel, -0,50)
+  const [depositReturnQty, setDepositReturnQty] = useState<number>(() => {
+    const raw = localStorage.getItem(STORAGE_KEY_DEPOSIT_RETURN_QTY);
     const n = raw ? Number(raw) : 0;
     return Number.isFinite(n) ? n : 0;
   });
 
-  const depositTotal = useMemo(() => round2((depositEnabled ? depositCups : 0) * DEPOSIT_VALUE), [depositEnabled, depositCups]);
+  useEffect(() => {
+    localStorage.setItem(STORAGE_KEY_DEPOSIT_RETURN_QTY, String(depositReturnQty));
+  }, [depositReturnQty]);
 
   const [error, setError] = useState<string | null>(null);
   const [loadingBars, setLoadingBars] = useState(true);
@@ -210,8 +210,14 @@ function KassaPage() {
 
   const [reportLoading, setReportLoading] = useState(false);
   const [reportError, setReportError] = useState<string | null>(null);
-  const [reportTotals, setReportTotals] = useState<{ brutto: number; ust: number; netto: number; bons: number; pfand: number; gesamt: number } | null>(null);
-
+  const [reportTotals, setReportTotals] = useState<{
+    brutto: number;
+    ust: number;
+    netto: number;
+    bons: number;
+    pfand: number;
+    gesamt: number;
+  } | null>(null);
 
   const selectedBar = useMemo(() => bars.find((b) => b.id === selectedBarId) ?? null, [bars, selectedBarId]);
   const cartLines = useMemo(() => Object.values(cart), [cart]);
@@ -221,7 +227,15 @@ function KassaPage() {
   const netTotal = useMemo(() => netFromGross(grossTotal), [grossTotal]);
   const taxTotal = useMemo(() => taxFromGross(grossTotal), [grossTotal]);
 
-  // Gesamt zu zahlen (Getränke brutto + Pfand (kann negativ sein))
+  // ✅ Pfand automatisch pro Getränk (+0,5€ je Stück) minus Rückgabe (-0,5€ je Tap)
+  const depositChargeQty = useMemo(() => cartLines.reduce((s, l) => s + l.qty, 0), [cartLines]);
+  const depositChargeTotal = useMemo(() => round2(depositChargeQty * DEPOSIT_VALUE), [depositChargeQty]);
+  const depositReturnTotal = useMemo(() => round2(depositReturnQty * DEPOSIT_VALUE), [depositReturnQty]);
+
+  // Pfand gesamt kann negativ werden
+  const depositTotal = useMemo(() => round2(depositChargeTotal - depositReturnTotal), [depositChargeTotal, depositReturnTotal]);
+
+  // Gesamt zu zahlen
   const totalPayable = useMemo(() => round2(grossTotal + depositTotal), [grossTotal, depositTotal]);
 
   // ====== Styles (any, damit TS bei dynamischen Funktionen nicht nervt) ======
@@ -467,18 +481,6 @@ function KassaPage() {
       outline: "none",
       fontSize: 16,
     },
-
-    table: {
-      width: "100%",
-      borderCollapse: "separate",
-      borderSpacing: 0,
-      overflow: "hidden",
-      border: "1px solid rgba(255,255,255,0.10)",
-      borderRadius: 16,
-      background: "rgba(255,255,255,0.04)",
-    },
-    th: { textAlign: "left", padding: 10, borderBottom: "1px solid rgba(255,255,255,0.08)", opacity: 0.85 },
-    td: { padding: 10, borderBottom: "1px solid rgba(255,255,255,0.06)" },
   };
 
   // ====== Daten laden ======
@@ -519,15 +521,6 @@ function KassaPage() {
     })();
   }, [selectedBarId]);
 
-  // ====== Persist Pfand settings ======
-  useEffect(() => {
-    localStorage.setItem(STORAGE_KEY_DEPOSIT_ENABLED, depositEnabled ? "1" : "0");
-  }, [depositEnabled]);
-
-  useEffect(() => {
-    localStorage.setItem(STORAGE_KEY_DEPOSIT_CUPS, String(depositCups));
-  }, [depositCups]);
-
   // ====== UI Actions ======
   function chooseBar(id: string) {
     localStorage.setItem(STORAGE_KEY_BAR, id);
@@ -537,6 +530,7 @@ function KassaPage() {
     setLastReceipt(null);
     setQrDataUrl(null);
     setError(null);
+    setDepositReturnQty(0);
   }
   function resetBar() {
     localStorage.removeItem(STORAGE_KEY_BAR);
@@ -547,6 +541,7 @@ function KassaPage() {
     setLastReceipt(null);
     setQrDataUrl(null);
     setError(null);
+    setDepositReturnQty(0);
   }
 
   function addToCart(p: Product) {
@@ -578,9 +573,10 @@ function KassaPage() {
   }
   function clearCart() {
     setCart({});
+    setDepositReturnQty(0);
   }
 
-  // ====== Print-Text (Netto oben / Brutto unten + Pfand) ======
+  // ====== Print-Text (Pfand separat) ======
   function buildReceiptText(args: {
     barName: string;
     receiptNo: string;
@@ -591,6 +587,8 @@ function KassaPage() {
     tax: number;
     net: number;
     deposit: number;
+    depositChargeQty: number;
+    depositReturnQty: number;
     totalPayable: number;
   }) {
     const head =
@@ -605,10 +603,14 @@ function KassaPage() {
 
     const foot =
       `-----------------------------\n` +
+      `PFAND (steuerfrei) ${euro(args.deposit)}\n` +
+      `  Ausgabe (${args.depositChargeQty}x0,50): ${euro(args.depositChargeQty * 0.5)}\n` +
+      `  Rueckg. (${args.depositReturnQty}x0,50): -${euro(args.depositReturnQty * 0.5)}\n` +
+      `-----------------------------\n` +
       `NETTO (Getr.)   ${euro(args.net)}\n` +
       `USt 20% (Getr.) ${euro(args.tax)}\n` +
       `BRUTTO (Getr.)  ${euro(args.gross)}\n` +
-      `PFAND           ${euro(args.deposit)}\n` +
+      `-----------------------------\n` +
       `GESAMT          ${euro(args.totalPayable)}\n`;
 
     return head + body + foot;
@@ -642,6 +644,7 @@ function KassaPage() {
     setLastReceipt(null);
     setQrDataUrl(null);
     setError(null);
+    setDepositReturnQty(0);
   }
 
   // ====== Checkout ======
@@ -671,7 +674,6 @@ function KassaPage() {
       const publicToken = randomToken(40);
       const createdAtISO = new Date().toISOString();
 
-      // Getränke-Werte steuerpflichtig, Pfand separat (steuerfrei)
       const dep = depositTotal;
       const total = totalPayable;
 
@@ -738,6 +740,8 @@ function KassaPage() {
           tax: taxTotal,
           net: netTotal,
           deposit: dep,
+          depositChargeQty,
+          depositReturnQty,
           totalPayable: total,
         });
 
@@ -768,8 +772,8 @@ function KassaPage() {
       });
       setQrDataUrl(qr);
 
-      clearCart();
-      // Pfand-Cups NICHT automatisch resetten – du willst evtl. Rückgabe direkt danach
+      setCart({});
+      setDepositReturnQty(0);
     } catch (e: any) {
       setError(e?.message ?? String(e));
     } finally {
@@ -906,6 +910,8 @@ function KassaPage() {
         tax: Number((o as any).tax_total),
         net: Number((o as any).net_total),
         deposit: dep,
+        depositChargeQty: 0,
+        depositReturnQty: 0,
         totalPayable: total,
       });
 
@@ -924,13 +930,12 @@ function KassaPage() {
       setReportLoading(true);
       setReportError(null);
       setReportTotals(null);
-    
 
       if (!adminUnlocked) return void setReportError("Bitte Admin entsperren.");
 
       let q = supabase
         .from("orders")
-        .select("id,bar_id,gross_total,tax_total,net_total,deposit_total,created_at,status")
+        .select("gross_total,tax_total,net_total,deposit_total,created_at,status")
         .eq("event_id", EVENT_ID)
         .eq("status", "completed");
 
@@ -950,35 +955,6 @@ function KassaPage() {
       const gesamt = round2(brutto + pfand);
 
       setReportTotals({ brutto, ust, netto, pfand, gesamt, bons: (orders ?? []).length });
-
-      const barMap = new Map<string, { bar: string; brutto: number; bons: number; pfand: number; gesamt: number }>();
-      for (const o of orders ?? []) {
-        const barName = bars.find((b) => b.id === (o as any).bar_id)?.name ?? "Unbekannt";
-        const ex = barMap.get(barName) ?? { bar: barName, brutto: 0, bons: 0, pfand: 0, gesamt: 0 };
-        const b = Number((o as any).gross_total);
-        const p = Number((o as any).deposit_total ?? 0);
-        ex.brutto = round2(ex.brutto + b);
-        ex.pfand = round2(ex.pfand + p);
-        ex.gesamt = round2(ex.gesamt + b + p);
-        ex.bons += 1;
-        barMap.set(barName, ex);
-      }
-      
-      const ids = (orders ?? []).map((o: any) => o.id);
-      if (ids.length) {
-        const { data: items, error: iErr } = await supabase.from("order_items").select("order_id,name_snapshot,qty,line_total_gross").in("order_id", ids);
-        if (iErr) throw new Error(iErr.message);
-
-        const prodMap = new Map<string, { produkt: string; menge: number; brutto: number }>();
-        for (const it of items ?? []) {
-          const key = (it as any).name_snapshot as string;
-          const ex = prodMap.get(key) ?? { produkt: key, menge: 0, brutto: 0 };
-          ex.menge += Number((it as any).qty);
-          ex.brutto = round2(ex.brutto + Number((it as any).line_total_gross));
-          prodMap.set(key, ex);
-        }
-       
-      }
     } catch (e: any) {
       setReportError(e?.message ?? String(e));
     } finally {
@@ -1028,8 +1004,6 @@ function KassaPage() {
               {loginMsg && <div style={{ ...styles.totals, color: "#ff8080", fontWeight: 900 }}>{loginMsg}</div>}
             </div>
           </div>
-
-          <div style={{ marginTop: 12, opacity: 0.65, fontSize: 12 }}>(Der Login wird pro Gerät gespeichert. Abmelden oben rechts bei Schichtwechsel.)</div>
         </div>
       </div>
     );
@@ -1047,32 +1021,7 @@ function KassaPage() {
             </p>
           </div>
 
-          {/* ✅ Pfand oben: ein Schalter + Becher +/- */}
           <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
-            <span style={styles.pill}>
-              <input
-                type="checkbox"
-                checked={depositEnabled}
-                onChange={(e) => setDepositEnabled(e.target.checked)}
-                style={{ width: 18, height: 18 }}
-              />
-              Pfand {euro(DEPOSIT_VALUE)}
-            </span>
-
-            {depositEnabled && (
-              <span style={styles.pill}>
-                Becher:
-                <button style={styles.subtleBtn} onClick={() => setDepositCups((c) => c - 1)} title="Rückgabe (kann negativ werden)">
-                  –
-                </button>
-                <b style={{ minWidth: 28, textAlign: "center" as const }}>{depositCups}</b>
-                <button style={styles.subtleBtn} onClick={() => setDepositCups((c) => c + 1)} title="Ausgabe">
-                  +
-                </button>
-                <span style={{ opacity: 0.85 }}>({euro(depositTotal)})</span>
-              </span>
-            )}
-
             <button style={styles.subtleBtn} onClick={openAdmin}>
               Admin {adminUnlocked ? `✓${adminUser?.name ? ` (${adminUser.name})` : ""}` : ""}
             </button>
@@ -1126,6 +1075,42 @@ function KassaPage() {
                 </div>
               ) : (
                 <div style={styles.productsGrid}>
+                  {/* ✅ Pfand-Rückgabe als Produkt-Kachel */}
+                  <div style={styles.productCard} onClick={() => setDepositReturnQty((q) => q + 1)}>
+                    <div style={styles.productName}>Becher-Rückgabe</div>
+                    <div style={styles.productPrice}>-{euro(DEPOSIT_VALUE)}</div>
+
+                    <div style={{ marginTop: 10, display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+                      <span style={styles.pill}>
+                        Rückgabe: <b>{depositReturnQty}</b>
+                      </span>
+                      <button
+                        style={styles.subtleBtn}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setDepositReturnQty((q) => Math.max(0, q - 1));
+                        }}
+                        title="1 Rückgabe entfernen"
+                      >
+                        –1
+                      </button>
+                      <button
+                        style={styles.subtleBtn}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setDepositReturnQty(0);
+                        }}
+                        title="Rückgabe zurücksetzen"
+                      >
+                        Reset
+                      </button>
+                    </div>
+
+                    <div style={{ marginTop: 10, opacity: 0.75, fontWeight: 800, fontSize: 13, lineHeight: 1.25 }}>
+                      Tipp: Jeder Tap = 1 Becher zurück → Pfand wird abgezogen (kann negativ werden).
+                    </div>
+                  </div>
+
                   {products.map((p) => (
                     <div key={p.id} style={styles.productCard} onClick={() => addToCart(p)}>
                       <div style={styles.productName}>{p.name}</div>
@@ -1203,6 +1188,9 @@ function KassaPage() {
                         <div>
                           <div style={{ fontWeight: 950 }}>{line.product.name}</div>
                           <div style={{ opacity: 0.8, marginTop: 4 }}>{euro(lineTotal)}</div>
+                          <div style={{ opacity: 0.65, marginTop: 4, fontSize: 12 }}>
+                            Pfand automatisch: {line.qty} × {euro(DEPOSIT_VALUE)}
+                          </div>
                         </div>
                         <div style={styles.qtyControls}>
                           <button style={styles.qtyBtn} onClick={() => dec(line.product.id)}>
@@ -1218,8 +1206,23 @@ function KassaPage() {
                   })}
                 </div>
 
-                {/* ✅ Netto oben / Brutto unten, Pfand steuerfrei separat */}
+                {/* ✅ Pfand oben + kann negativ */}
                 <div style={styles.totals}>
+                  <div style={{ ...styles.totalRow, fontWeight: 950 }}>
+                    <span>Pfand (steuerfrei)</span>
+                    <span>{euro(depositTotal)}</span>
+                  </div>
+                  <div style={{ ...styles.totalRow, opacity: 0.85 }}>
+                    <span>Pfand-Ausgabe ({depositChargeQty} × 0,50)</span>
+                    <span>{euro(depositChargeTotal)}</span>
+                  </div>
+                  <div style={{ ...styles.totalRow, opacity: 0.85 }}>
+                    <span>Pfand-Rückgabe ({depositReturnQty} × 0,50)</span>
+                    <span>-{euro(depositReturnTotal)}</span>
+                  </div>
+
+                  <div style={{ height: 1, background: "rgba(255,255,255,0.08)", margin: "6px 0" }} />
+
                   <div style={styles.totalRow}>
                     <span>Netto (Getränke)</span>
                     <span>{euro(netTotal)}</span>
@@ -1232,10 +1235,7 @@ function KassaPage() {
                     <span>Brutto (Getränke)</span>
                     <span>{euro(grossTotal)}</span>
                   </div>
-                  <div style={styles.totalRow}>
-                    <span>Pfand</span>
-                    <span>{euro(depositTotal)}</span>
-                  </div>
+
                   <div style={{ ...styles.totalRow, fontWeight: 950, fontSize: 16 }}>
                     <span>Gesamt</span>
                     <span>{euro(totalPayable)}</span>
@@ -1268,7 +1268,7 @@ function KassaPage() {
                   </button>
 
                   <div style={{ ...styles.hint, gridColumn: "1 / -1" }}>
-                    Standard: digitaler Beleg (Anzeige + QR). Papier nur auf Nachfrage – sonst Chaos am zentralen Drucker.
+                    Pfand: automatisch +0,50 € pro Getränk • Rückgabe über „Becher-Rückgabe“ (–0,50 €) • kann negativ werden.
                   </div>
 
                   {error && (
@@ -1438,10 +1438,6 @@ function KassaPage() {
           </div>
         </div>
       )}
-
-      <div style={{ maxWidth: 1280, margin: "0 auto", padding: "0 16px 16px 16px", opacity: 0.6, fontSize: 12 }}>
-        Pfand: {euro(DEPOSIT_VALUE)} (steuerfrei) • kann negativ sein (Rückgabe) • Totals: Netto oben / Brutto unten
-      </div>
     </div>
   );
 }
@@ -1506,6 +1502,9 @@ function ReceiptPage() {
     lineHeight: 1.35,
   };
 
+  const deposit = order ? Number(order.deposit_total ?? 0) : 0;
+  const total = order ? round2(Number(order.gross_total) + deposit) : 0;
+
   return (
     <div style={pageStyle}>
       <div style={cardStyle}>
@@ -1527,11 +1526,13 @@ function ReceiptPage() {
               {`-----------------------------\n`}
               {items.map((it) => `${it.qty}x ${it.name_snapshot}  ${euro(Number(it.line_total_gross))}\n`).join("")}
               {`-----------------------------\n`}
+              {`PFAND (steuerfrei) ${euro(deposit)}\n`}
+              {`-----------------------------\n`}
               {`NETTO (Getr.)   ${euro(Number(order.net_total))}\n`}
               {`USt 20% (Getr.) ${euro(Number(order.tax_total))}\n`}
               {`BRUTTO (Getr.)  ${euro(Number(order.gross_total))}\n`}
-              {`PFAND           ${euro(Number(order.deposit_total ?? 0))}\n`}
-              {`GESAMT          ${euro(round2(Number(order.gross_total) + Number(order.deposit_total ?? 0)))}\n`}
+              {`-----------------------------\n`}
+              {`GESAMT          ${euro(total)}\n`}
             </div>
           )}
         </div>
