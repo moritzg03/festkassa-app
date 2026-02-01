@@ -29,6 +29,8 @@ type ReceiptResponse = {
   gross: number;
   tax: number;
   net: number;
+  deposit: number;
+  total_payable: number;
 };
 
 type ReceiptOrderRow = {
@@ -39,6 +41,7 @@ type ReceiptOrderRow = {
   gross_total: number;
   tax_total: number;
   net_total: number;
+  deposit_total: number;
   status: "completed" | "voided";
 };
 
@@ -52,6 +55,11 @@ type ReceiptItemRow = {
 // ====== KONFIG ======
 const EVENT_ID = "00000000-0000-0000-0000-000000000001";
 const VAT_RATE = 0.2;
+
+// Pfand
+const DEPOSIT_VALUE = 0.5;
+const STORAGE_KEY_DEPOSIT_ENABLED = "festkassa:depositEnabled";
+const STORAGE_KEY_DEPOSIT_CUPS = "festkassa:depositCups";
 
 const STORAGE_KEY_BAR = "festkassa:selectedBarId";
 const STORAGE_KEY_DEVICE = "festkassa:deviceId";
@@ -158,6 +166,16 @@ function KassaPage() {
   const [cart, setCart] = useState<Record<string, CartLine>>({});
   const [paymentMethod, setPaymentMethod] = useState<"cash" | "sumup">("cash");
 
+  // ✅ Pfand: global, oben steuerbar
+  const [depositEnabled, setDepositEnabled] = useState<boolean>(() => localStorage.getItem(STORAGE_KEY_DEPOSIT_ENABLED) === "1");
+  const [depositCups, setDepositCups] = useState<number>(() => {
+    const raw = localStorage.getItem(STORAGE_KEY_DEPOSIT_CUPS);
+    const n = raw ? Number(raw) : 0;
+    return Number.isFinite(n) ? n : 0;
+  });
+
+  const depositTotal = useMemo(() => round2((depositEnabled ? depositCups : 0) * DEPOSIT_VALUE), [depositEnabled, depositCups]);
+
   const [error, setError] = useState<string | null>(null);
   const [loadingBars, setLoadingBars] = useState(true);
   const [loadingProducts, setLoadingProducts] = useState(false);
@@ -192,16 +210,20 @@ function KassaPage() {
 
   const [reportLoading, setReportLoading] = useState(false);
   const [reportError, setReportError] = useState<string | null>(null);
-  const [reportTotals, setReportTotals] = useState<{ brutto: number; ust: number; netto: number; bons: number } | null>(null);
-  const [reportByBar, setReportByBar] = useState<Array<{ bar: string; brutto: number; bons: number }>>([]);
+  const [reportTotals, setReportTotals] = useState<{ brutto: number; ust: number; netto: number; bons: number; pfand: number; gesamt: number } | null>(null);
+  const [reportByBar, setReportByBar] = useState<Array<{ bar: string; brutto: number; bons: number; pfand: number; gesamt: number }>>([]);
   const [reportByProduct, setReportByProduct] = useState<Array<{ produkt: string; menge: number; brutto: number }>>([]);
 
   const selectedBar = useMemo(() => bars.find((b) => b.id === selectedBarId) ?? null, [bars, selectedBarId]);
   const cartLines = useMemo(() => Object.values(cart), [cart]);
 
+  // Getränke-Summen (steuerpflichtig)
   const grossTotal = useMemo(() => round2(cartLines.reduce((s, l) => s + Number(l.product.price_gross) * l.qty, 0)), [cartLines]);
   const netTotal = useMemo(() => netFromGross(grossTotal), [grossTotal]);
   const taxTotal = useMemo(() => taxFromGross(grossTotal), [grossTotal]);
+
+  // Gesamt zu zahlen (Getränke brutto + Pfand (kann negativ sein))
+  const totalPayable = useMemo(() => round2(grossTotal + depositTotal), [grossTotal, depositTotal]);
 
   // ====== Styles (any, damit TS bei dynamischen Funktionen nicht nervt) ======
   const styles: Record<string, any> = {
@@ -381,7 +403,7 @@ function KassaPage() {
       gap: 10,
     }),
 
-    bigCheckout: {
+    bigCheckout: (disabled: boolean): React.CSSProperties => ({
       gridColumn: "1 / -1",
       padding: "14px 14px",
       borderRadius: 18,
@@ -391,9 +413,9 @@ function KassaPage() {
       fontWeight: 950,
       fontSize: 18,
       cursor: "pointer",
-      opacity: checkoutLoading ? 0.6 : 1,
+      opacity: disabled ? 0.6 : 1,
       touchAction: "manipulation",
-    },
+    }),
 
     hint: { opacity: 0.75, fontSize: 13, lineHeight: 1.35 },
 
@@ -498,6 +520,15 @@ function KassaPage() {
     })();
   }, [selectedBarId]);
 
+  // ====== Persist Pfand settings ======
+  useEffect(() => {
+    localStorage.setItem(STORAGE_KEY_DEPOSIT_ENABLED, depositEnabled ? "1" : "0");
+  }, [depositEnabled]);
+
+  useEffect(() => {
+    localStorage.setItem(STORAGE_KEY_DEPOSIT_CUPS, String(depositCups));
+  }, [depositCups]);
+
   // ====== UI Actions ======
   function chooseBar(id: string) {
     localStorage.setItem(STORAGE_KEY_BAR, id);
@@ -550,7 +581,7 @@ function KassaPage() {
     setCart({});
   }
 
-  // ====== Print-Text (Netto oben / Brutto unten) ======
+  // ====== Print-Text (Netto oben / Brutto unten + Pfand) ======
   function buildReceiptText(args: {
     barName: string;
     receiptNo: string;
@@ -560,6 +591,8 @@ function KassaPage() {
     gross: number;
     tax: number;
     net: number;
+    deposit: number;
+    totalPayable: number;
   }) {
     const head =
       `*** ${args.barName.toUpperCase()} ***\n` +
@@ -571,12 +604,13 @@ function KassaPage() {
 
     const body = args.lines.map((l) => `${l.qty}x ${l.name}  ${euro(l.lineTotal)}\n`).join("");
 
-    // ✅ Netto oben, Brutto unten
     const foot =
       `-----------------------------\n` +
-      `NETTO   ${euro(args.net)}\n` +
-      `USt 20% ${euro(args.tax)}\n` +
-      `BRUTTO  ${euro(args.gross)}\n`;
+      `NETTO (Getr.)   ${euro(args.net)}\n` +
+      `USt 20% (Getr.) ${euro(args.tax)}\n` +
+      `BRUTTO (Getr.)  ${euro(args.gross)}\n` +
+      `PFAND           ${euro(args.deposit)}\n` +
+      `GESAMT          ${euro(args.totalPayable)}\n`;
 
     return head + body + foot;
   }
@@ -624,7 +658,6 @@ function KassaPage() {
 
       const deviceId = getDeviceId();
 
-      // ✅ Robust: RPC liefert meist ein Array zurück
       const { data: seqRows, error: seqErr } = await supabase.rpc("next_receipt", { p_event_id: EVENT_ID });
       if (seqErr) throw new Error(seqErr.message);
 
@@ -639,6 +672,10 @@ function KassaPage() {
       const publicToken = randomToken(40);
       const createdAtISO = new Date().toISOString();
 
+      // Getränke-Werte steuerpflichtig, Pfand separat (steuerfrei)
+      const dep = depositTotal;
+      const total = totalPayable;
+
       const { data: order, error: oErr } = await supabase
         .from("orders")
         .insert({
@@ -646,7 +683,7 @@ function KassaPage() {
           bar_id: selectedBarId,
           device_id: deviceId,
 
-          cashier_user_id: null, // falls legacy existiert
+          cashier_user_id: null,
           cashier_staff_id: staff.id,
           cashier_name_snapshot: staff.name,
           cashier_role_snapshot: staff.role,
@@ -662,6 +699,8 @@ function KassaPage() {
           tax_rate: VAT_RATE,
           tax_total: taxTotal,
           net_total: netTotal,
+
+          deposit_total: dep,
 
           receipt_offered: true,
           receipt_printed: printRequested ? true : false,
@@ -699,6 +738,8 @@ function KassaPage() {
           gross: grossTotal,
           tax: taxTotal,
           net: netTotal,
+          deposit: dep,
+          totalPayable: total,
         });
 
         const { error: pErr } = await supabase.from("print_jobs").insert({
@@ -723,10 +764,13 @@ function KassaPage() {
         gross: grossTotal,
         tax: taxTotal,
         net: netTotal,
+        deposit: dep,
+        total_payable: total,
       });
       setQrDataUrl(qr);
 
       clearCart();
+      // Pfand-Cups NICHT automatisch resetten – du willst evtl. Rückgabe direkt danach
     } catch (e: any) {
       setError(e?.message ?? String(e));
     } finally {
@@ -837,7 +881,7 @@ function KassaPage() {
 
       const { data: o, error: oErr } = await supabase
         .from("orders")
-        .select("id,bar_id,receipt_no,created_at,payment_method,gross_total,tax_total,net_total")
+        .select("id,bar_id,receipt_no,created_at,payment_method,gross_total,tax_total,net_total,deposit_total")
         .eq("event_id", EVENT_ID)
         .eq("receipt_no", r)
         .single();
@@ -850,6 +894,9 @@ function KassaPage() {
 
       const barName = bars.find((b) => b.id === (o as any).bar_id)?.name ?? "Bar";
 
+      const dep = Number((o as any).deposit_total ?? 0);
+      const total = round2(Number((o as any).gross_total) + dep);
+
       const payload = buildReceiptText({
         barName,
         receiptNo: (o as any).receipt_no,
@@ -859,6 +906,8 @@ function KassaPage() {
         gross: Number((o as any).gross_total),
         tax: Number((o as any).tax_total),
         net: Number((o as any).net_total),
+        deposit: dep,
+        totalPayable: total,
       });
 
       const { error: pErr } = await supabase.from("print_jobs").insert({ event_id: EVENT_ID, order_id: (o as any).id, payload, status: "queued" });
@@ -881,7 +930,11 @@ function KassaPage() {
 
       if (!adminUnlocked) return void setReportError("Bitte Admin entsperren.");
 
-      let q = supabase.from("orders").select("id,bar_id,gross_total,tax_total,net_total,created_at,status").eq("event_id", EVENT_ID).eq("status", "completed");
+      let q = supabase
+        .from("orders")
+        .select("id,bar_id,gross_total,tax_total,net_total,deposit_total,created_at,status")
+        .eq("event_id", EVENT_ID)
+        .eq("status", "completed");
 
       if (range === "today") {
         const start = new Date();
@@ -892,23 +945,27 @@ function KassaPage() {
       const { data: orders, error: oErr } = await q;
       if (oErr) throw new Error(oErr.message);
 
-      const totals = {
-        brutto: round2((orders ?? []).reduce((s: number, o: any) => s + Number(o.gross_total), 0)),
-        ust: round2((orders ?? []).reduce((s: number, o: any) => s + Number(o.tax_total), 0)),
-        netto: round2((orders ?? []).reduce((s: number, o: any) => s + Number(o.net_total), 0)),
-        bons: (orders ?? []).length,
-      };
-      setReportTotals(totals);
+      const brutto = round2((orders ?? []).reduce((s: number, o: any) => s + Number(o.gross_total), 0));
+      const ust = round2((orders ?? []).reduce((s: number, o: any) => s + Number(o.tax_total), 0));
+      const netto = round2((orders ?? []).reduce((s: number, o: any) => s + Number(o.net_total), 0));
+      const pfand = round2((orders ?? []).reduce((s: number, o: any) => s + Number(o.deposit_total ?? 0), 0));
+      const gesamt = round2(brutto + pfand);
 
-      const barMap = new Map<string, { bar: string; brutto: number; bons: number }>();
+      setReportTotals({ brutto, ust, netto, pfand, gesamt, bons: (orders ?? []).length });
+
+      const barMap = new Map<string, { bar: string; brutto: number; bons: number; pfand: number; gesamt: number }>();
       for (const o of orders ?? []) {
         const barName = bars.find((b) => b.id === (o as any).bar_id)?.name ?? "Unbekannt";
-        const ex = barMap.get(barName) ?? { bar: barName, brutto: 0, bons: 0 };
-        ex.brutto = round2(ex.brutto + Number((o as any).gross_total));
+        const ex = barMap.get(barName) ?? { bar: barName, brutto: 0, bons: 0, pfand: 0, gesamt: 0 };
+        const b = Number((o as any).gross_total);
+        const p = Number((o as any).deposit_total ?? 0);
+        ex.brutto = round2(ex.brutto + b);
+        ex.pfand = round2(ex.pfand + p);
+        ex.gesamt = round2(ex.gesamt + b + p);
         ex.bons += 1;
         barMap.set(barName, ex);
       }
-      setReportByBar(Array.from(barMap.values()).sort((a, b) => b.brutto - a.brutto));
+      setReportByBar(Array.from(barMap.values()).sort((a, b) => b.gesamt - a.gesamt));
 
       const ids = (orders ?? []).map((o: any) => o.id);
       if (ids.length) {
@@ -975,9 +1032,7 @@ function KassaPage() {
             </div>
           </div>
 
-          <div style={{ marginTop: 12, opacity: 0.65, fontSize: 12 }}>
-            (Der Login wird pro Gerät gespeichert. Abmelden oben rechts bei Schichtwechsel.)
-          </div>
+          <div style={{ marginTop: 12, opacity: 0.65, fontSize: 12 }}>(Der Login wird pro Gerät gespeichert. Abmelden oben rechts bei Schichtwechsel.)</div>
         </div>
       </div>
     );
@@ -995,7 +1050,32 @@ function KassaPage() {
             </p>
           </div>
 
+          {/* ✅ Pfand oben: ein Schalter + Becher +/- */}
           <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+            <span style={styles.pill}>
+              <input
+                type="checkbox"
+                checked={depositEnabled}
+                onChange={(e) => setDepositEnabled(e.target.checked)}
+                style={{ width: 18, height: 18 }}
+              />
+              Pfand {euro(DEPOSIT_VALUE)}
+            </span>
+
+            {depositEnabled && (
+              <span style={styles.pill}>
+                Becher:
+                <button style={styles.subtleBtn} onClick={() => setDepositCups((c) => c - 1)} title="Rückgabe (kann negativ werden)">
+                  –
+                </button>
+                <b style={{ minWidth: 28, textAlign: "center" as const }}>{depositCups}</b>
+                <button style={styles.subtleBtn} onClick={() => setDepositCups((c) => c + 1)} title="Ausgabe">
+                  +
+                </button>
+                <span style={{ opacity: 0.85 }}>({euro(depositTotal)})</span>
+              </span>
+            )}
+
             <button style={styles.subtleBtn} onClick={openAdmin}>
               Admin {adminUnlocked ? `✓${adminUser?.name ? ` (${adminUser.name})` : ""}` : ""}
             </button>
@@ -1141,19 +1221,27 @@ function KassaPage() {
                   })}
                 </div>
 
-                {/* ✅ Netto oben, Brutto unten (Totals überall) */}
+                {/* ✅ Netto oben / Brutto unten, Pfand steuerfrei separat */}
                 <div style={styles.totals}>
                   <div style={styles.totalRow}>
-                    <span>Netto</span>
+                    <span>Netto (Getränke)</span>
                     <span>{euro(netTotal)}</span>
                   </div>
                   <div style={styles.totalRow}>
-                    <span>USt 20%</span>
+                    <span>USt 20% (Getränke)</span>
                     <span>{euro(taxTotal)}</span>
                   </div>
-                  <div style={{ ...styles.totalRow, fontWeight: 950, fontSize: 16 }}>
-                    <span>Brutto</span>
+                  <div style={styles.totalRow}>
+                    <span>Brutto (Getränke)</span>
                     <span>{euro(grossTotal)}</span>
+                  </div>
+                  <div style={styles.totalRow}>
+                    <span>Pfand</span>
+                    <span>{euro(depositTotal)}</span>
+                  </div>
+                  <div style={{ ...styles.totalRow, fontWeight: 950, fontSize: 16 }}>
+                    <span>Gesamt</span>
+                    <span>{euro(totalPayable)}</span>
                   </div>
                 </div>
 
@@ -1178,7 +1266,7 @@ function KassaPage() {
                     Abschließen + Drucken
                   </button>
 
-                  <button style={styles.bigCheckout} disabled={checkoutLoading} onClick={() => doCheckout(false)}>
+                  <button style={styles.bigCheckout(checkoutLoading)} disabled={checkoutLoading} onClick={() => doCheckout(false)}>
                     {checkoutLoading ? "Speichere…" : "Abschließen (digital)"}
                   </button>
 
@@ -1325,68 +1413,26 @@ function KassaPage() {
                         <span>Gesamt</span>
                         <span>{reportTotals.bons} Bons</span>
                       </div>
-
-                      {/* ✅ Netto oben, Brutto unten */}
                       <div style={styles.totalRow}>
-                        <span>Netto</span>
+                        <span>Netto (Getränke)</span>
                         <span>{euro(reportTotals.netto)}</span>
                       </div>
                       <div style={styles.totalRow}>
-                        <span>USt 20%</span>
+                        <span>USt 20% (Getränke)</span>
                         <span>{euro(reportTotals.ust)}</span>
                       </div>
-                      <div style={{ ...styles.totalRow, fontWeight: 950 }}>
-                        <span>Brutto</span>
+                      <div style={styles.totalRow}>
+                        <span>Brutto (Getränke)</span>
                         <span>{euro(reportTotals.brutto)}</span>
                       </div>
-                    </div>
-                  )}
-
-                  {reportByBar.length > 0 && (
-                    <div>
-                      <div style={{ fontWeight: 950, marginBottom: 8 }}>Umsatz pro Bar (Brutto)</div>
-                      <table style={styles.table}>
-                        <thead>
-                          <tr>
-                            <th style={styles.th}>Bar</th>
-                            <th style={styles.th}>Bons</th>
-                            <th style={styles.th}>Brutto</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {reportByBar.map((r) => (
-                            <tr key={r.bar}>
-                              <td style={styles.td}>{r.bar}</td>
-                              <td style={styles.td}>{r.bons}</td>
-                              <td style={styles.td}>{euro(r.brutto)}</td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </div>
-                  )}
-
-                  {reportByProduct.length > 0 && (
-                    <div>
-                      <div style={{ fontWeight: 950, marginBottom: 8 }}>Top Produkte (Brutto)</div>
-                      <table style={styles.table}>
-                        <thead>
-                          <tr>
-                            <th style={styles.th}>Produkt</th>
-                            <th style={styles.th}>Menge</th>
-                            <th style={styles.th}>Brutto</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {reportByProduct.slice(0, 30).map((r) => (
-                            <tr key={r.produkt}>
-                              <td style={styles.td}>{r.produkt}</td>
-                              <td style={styles.td}>{r.menge}</td>
-                              <td style={styles.td}>{euro(r.brutto)}</td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
+                      <div style={styles.totalRow}>
+                        <span>Pfand</span>
+                        <span>{euro(reportTotals.pfand)}</span>
+                      </div>
+                      <div style={{ ...styles.totalRow, fontWeight: 950 }}>
+                        <span>Gesamt</span>
+                        <span>{euro(reportTotals.gesamt)}</span>
+                      </div>
                     </div>
                   )}
                 </>
@@ -1397,7 +1443,7 @@ function KassaPage() {
       )}
 
       <div style={{ maxWidth: 1280, margin: "0 auto", padding: "0 16px 16px 16px", opacity: 0.6, fontSize: 12 }}>
-        UI responsive • Totals: Netto oben / Brutto unten • Login+Storno via RPC <b>check_staff_pin</b>
+        Pfand: {euro(DEPOSIT_VALUE)} (steuerfrei) • kann negativ sein (Rückgabe) • Totals: Netto oben / Brutto unten
       </div>
     </div>
   );
@@ -1420,7 +1466,7 @@ function ReceiptPage() {
 
         const { data: o, error: oErr } = await supabase
           .from("orders")
-          .select("id,receipt_no,created_at,payment_method,gross_total,tax_total,net_total,status")
+          .select("id,receipt_no,created_at,payment_method,gross_total,tax_total,net_total,deposit_total,status")
           .eq("public_token", token)
           .single();
 
@@ -1484,10 +1530,11 @@ function ReceiptPage() {
               {`-----------------------------\n`}
               {items.map((it) => `${it.qty}x ${it.name_snapshot}  ${euro(Number(it.line_total_gross))}\n`).join("")}
               {`-----------------------------\n`}
-              {/* ✅ Netto oben, Brutto unten */}
-              {`NETTO   ${euro(Number(order.net_total))}\n`}
-              {`USt 20% ${euro(Number(order.tax_total))}\n`}
-              {`BRUTTO  ${euro(Number(order.gross_total))}\n`}
+              {`NETTO (Getr.)   ${euro(Number(order.net_total))}\n`}
+              {`USt 20% (Getr.) ${euro(Number(order.tax_total))}\n`}
+              {`BRUTTO (Getr.)  ${euro(Number(order.gross_total))}\n`}
+              {`PFAND           ${euro(Number(order.deposit_total ?? 0))}\n`}
+              {`GESAMT          ${euro(round2(Number(order.gross_total) + Number(order.deposit_total ?? 0)))}\n`}
             </div>
           )}
         </div>
