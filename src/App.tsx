@@ -211,8 +211,7 @@ function KassaPage() {
   const [reportLoading, setReportLoading] = useState(false);
   const [reportError, setReportError] = useState<string | null>(null);
   const [reportTotals, setReportTotals] = useState<{ brutto: number; ust: number; netto: number; bons: number; pfand: number; gesamt: number } | null>(null);
-  const [reportByBar, setReportByBar] = useState<Array<{ bar: string; brutto: number; bons: number; pfand: number; gesamt: number }>>([]);
-  const [reportByProduct, setReportByProduct] = useState<Array<{ produkt: string; menge: number; brutto: number }>>([]);
+
 
   const selectedBar = useMemo(() => bars.find((b) => b.id === selectedBarId) ?? null, [bars, selectedBarId]);
   const cartLines = useMemo(() => Object.values(cart), [cart]);
@@ -925,8 +924,7 @@ function KassaPage() {
       setReportLoading(true);
       setReportError(null);
       setReportTotals(null);
-      setReportByBar([]);
-      setReportByProduct([]);
+    
 
       if (!adminUnlocked) return void setReportError("Bitte Admin entsperren.");
 
@@ -965,8 +963,7 @@ function KassaPage() {
         ex.bons += 1;
         barMap.set(barName, ex);
       }
-      setReportByBar(Array.from(barMap.values()).sort((a, b) => b.gesamt - a.gesamt));
-
+      
       const ids = (orders ?? []).map((o: any) => o.id);
       if (ids.length) {
         const { data: items, error: iErr } = await supabase.from("order_items").select("order_id,name_snapshot,qty,line_total_gross").in("order_id", ids);
@@ -980,7 +977,7 @@ function KassaPage() {
           ex.brutto = round2(ex.brutto + Number((it as any).line_total_gross));
           prodMap.set(key, ex);
         }
-        setReportByProduct(Array.from(prodMap.values()).sort((a, b) => b.brutto - a.brutto));
+       
       }
     } catch (e: any) {
       setReportError(e?.message ?? String(e));
